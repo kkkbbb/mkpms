@@ -1,0 +1,22 @@
+# Prerequisites
+*.d
+
+# Object files
+*.o
+*.ko
+*.obj
+*.elf
+
+# Libraries
+*.lib
+*.a
+*.la
+*.lo
+
+*.bin
+*.elf
+
+# kernel patch module
+*.kpm
+
+kpimg
