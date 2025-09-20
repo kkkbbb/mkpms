@@ -1,0 +1,1 @@
+add_kpm_module(hide-maps hidemaps.c)
