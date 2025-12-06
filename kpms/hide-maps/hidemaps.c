@@ -58,24 +58,9 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
     memcpy(line, m->buf + start, end - start);
     line[end - start] = 0;
 
-    if (strstr(line,"r-x"))
-    {
-        if (flag) m->count = start;
-        flag = true;
-    }else
-    {
-        flag = false;
-    }
-
-    if (strstr(line,"vlite"))
-    {
-        m->count = start;
-    }
-
-
-    if (strstr(line, "rwxp")) {
-        // pr_info("KP: show_map_hook frida hook %s", line);
-        m->count = start;
+    char *pos = strstr(m->buf + start, "rwxp");
+    if (pos && pos < m->buf + end) {
+        pos[1] = '-';  // rwxp -> r-xp
     }
     vfree(line);
 }
