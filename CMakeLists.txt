@@ -41,7 +41,7 @@ function(add_kpm_module MODULE_NAME SOURCE_FILE)
     target_include_directories(${MODULE_NAME}_obj PRIVATE ${GLOBAL_INCLUDE_DIRS})
 
     # 设置编译选项
-    target_compile_options(${MODULE_NAME}_obj PRIVATE -O2 -fno-stack-protector -fno-builtin -nostdinc -fno-PIC -T${KP_DIR}/hello.lds})
+    target_compile_options(${MODULE_NAME}_obj PRIVATE -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -fno-builtin -nostdinc -fno-PIC -T${KP_DIR}/hello.lds})
 
 
     add_custom_target(${MODULE_NAME}.kpm ALL
