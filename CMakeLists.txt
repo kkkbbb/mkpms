@@ -27,28 +27,47 @@ foreach(dir ${KERNEL_INCLUDE_DIRS})
 endforeach()
 
 # 定义通用的KPM模块构建函数
-function(add_kpm_module MODULE_NAME SOURCE_FILE)
+function(add_kpm_module MODULE_NAME)
     # 解析可选参数
     set(options "")
     set(oneValueArgs LINKER_SCRIPT)
-    set(multiValueArgs "")
+    set(multiValueArgs SOURCES)
     cmake_parse_arguments(KPM "${options}" "${oneValueArgs}" "${multiValueArgs}" ${ARGN})
 
+    # 获取源文件列表 - 支持旧格式(直接列出源文件)和新格式(SOURCES 关键字)
+    if(KPM_SOURCES)
+        set(SOURCE_FILES ${KPM_SOURCES})
+    elseif(KPM_UNPARSED_ARGUMENTS)
+        set(SOURCE_FILES ${KPM_UNPARSED_ARGUMENTS})
+    else()
+        message(FATAL_ERROR "add_kpm_module: No source files specified for ${MODULE_NAME}")
+    endif()
+
     # 创建目标文件
-    add_library(${MODULE_NAME}_obj OBJECT ${SOURCE_FILE})
+    add_library(${MODULE_NAME}_obj OBJECT ${SOURCE_FILES})
 
     # 设置包含目录
     target_include_directories(${MODULE_NAME}_obj PRIVATE ${GLOBAL_INCLUDE_DIRS})
 
     # 设置编译选项
-    target_compile_options(${MODULE_NAME}_obj PRIVATE -fno-asynchronous-unwind-tables -fno-unwind-tables -fno-stack-protector -fno-builtin -nostdinc -fno-PIC -T${KP_DIR}/hello.lds})
+    target_compile_options(${MODULE_NAME}_obj PRIVATE
+        -fno-stack-protector
+        -fno-builtin
+        -nostdinc
+        -fno-PIC
+        -mno-outline-atomics
+        -mcmodel=large
+        -fno-asynchronous-unwind-tables
+        -fno-unwind-tables
+    )
 
 
     add_custom_target(${MODULE_NAME}.kpm ALL
-            COMMAND ${CMAKE_C_COMPILER} -r -o ${MODULE_NAME}.kpm $<TARGET_OBJECTS:${MODULE_NAME}_obj>
+            COMMAND ${CMAKE_C_COMPILER} -r -o ${MODULE_NAME}.kpm "$<TARGET_OBJECTS:${MODULE_NAME}_obj>"
             DEPENDS ${MODULE_NAME}_obj
             COMMENT "Generating ${MODULE_NAME}.kpm"
             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}
+            COMMAND_EXPAND_LISTS
     )
 
     # 添加清理规则
