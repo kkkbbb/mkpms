@@ -1,4 +1,4 @@
-# android 无痕probe kpm demo
+# android 无痕probe 无痕hook kpm demo
 对任意地址设置断点，打印、修改寄存器，缺陷：无法对自读代码区域设置断点，同一页无法同时读取和执行
 
 # 使用方法
