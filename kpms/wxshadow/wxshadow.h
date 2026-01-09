@@ -91,6 +91,37 @@ struct wxshadow_page {
 #define DBG_HOOK_HANDLED    0
 #define DBG_HOOK_ERROR      1
 
+/*
+ * Hook method selection
+ * WX_HOOK_METHOD_DIRECT: hook_wrap brk_handler/single_step_handler directly
+ * WX_HOOK_METHOD_REGISTER: use register_user_break_hook/register_user_step_hook API
+ */
+enum wx_hook_method {
+    WX_HOOK_METHOD_NONE = 0,
+    WX_HOOK_METHOD_DIRECT,      /* Direct hook (preferred) */
+    WX_HOOK_METHOD_REGISTER,    /* register_user_*_hook API (fallback) */
+};
+
+/*
+ * struct break_hook - for register_user_break_hook API
+ * Must match kernel's struct break_hook layout (arch/arm64/include/asm/debug-monitors.h)
+ */
+struct wx_break_hook {
+    struct list_head node;
+    int (*fn)(struct pt_regs *regs, unsigned int esr);
+    u16 imm;
+    u16 mask;
+};
+
+/*
+ * struct step_hook - for register_user_step_hook API
+ * Must match kernel's struct step_hook layout (arch/arm64/include/asm/debug-monitors.h)
+ */
+struct wx_step_hook {
+    struct list_head node;
+    int (*fn)(struct pt_regs *regs, unsigned int esr);
+};
+
 /* VM fault return values */
 #define VM_FAULT_NOPAGE     0x0001
 #define VM_FAULT_SIGBUS     0x0002

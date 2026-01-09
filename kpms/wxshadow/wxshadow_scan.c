@@ -278,20 +278,42 @@ int resolve_symbols(void)
     }
 
     /* ===== BRK/Step hooks ===== */
-    pr_err("wxshadow: [9/12] BRK/step hooks...\n");
+    pr_info("wxshadow: [9/12] BRK/step hooks...\n");
 
-    /* Always use direct hook method - register_user_break_hook struct layout varies by kernel version */
+    /* Resolve all symbols - let wxshadow_init decide priority */
+    /* Direct hook symbols */
     kfunc_brk_handler = (void *)lookup_name_safe("brk_handler");
     kfunc_single_step_handler = (void *)lookup_name_safe("single_step_handler");
-    pr_err("wxshadow: brk_handler = %px\n", kfunc_brk_handler);
-    pr_err("wxshadow: single_step_handler = %px\n", kfunc_single_step_handler);
+    pr_info("wxshadow: brk_handler = %px\n", kfunc_brk_handler);
+    pr_info("wxshadow: single_step_handler = %px\n", kfunc_single_step_handler);
 
-    if (!kfunc_brk_handler || !kfunc_single_step_handler) {
-        pr_err("wxshadow: brk_handler or single_step_handler not found\n");
+    /* Register API symbols */
+    kfunc_register_user_break_hook = (typeof(kfunc_register_user_break_hook))
+        lookup_name_safe("register_user_break_hook");
+    kfunc_unregister_user_break_hook = (typeof(kfunc_unregister_user_break_hook))
+        lookup_name_safe("unregister_user_break_hook");
+    kfunc_register_user_step_hook = (typeof(kfunc_register_user_step_hook))
+        lookup_name_safe("register_user_step_hook");
+    kfunc_unregister_user_step_hook = (typeof(kfunc_unregister_user_step_hook))
+        lookup_name_safe("unregister_user_step_hook");
+
+    pr_info("wxshadow: register_user_break_hook = %px\n", kfunc_register_user_break_hook);
+    pr_info("wxshadow: unregister_user_break_hook = %px\n", kfunc_unregister_user_break_hook);
+    pr_info("wxshadow: register_user_step_hook = %px\n", kfunc_register_user_step_hook);
+    pr_info("wxshadow: unregister_user_step_hook = %px\n", kfunc_unregister_user_step_hook);
+
+    /* debug_hook_lock for safe manual unregister */
+    kptr_debug_hook_lock = (spinlock_t *)lookup_name_safe("debug_hook_lock");
+    pr_info("wxshadow: debug_hook_lock = %px\n", kptr_debug_hook_lock);
+
+    /* Check if at least one method is available */
+    if (!(kfunc_brk_handler && kfunc_single_step_handler) &&
+        !(kfunc_register_user_break_hook && kfunc_unregister_user_break_hook &&
+          kfunc_register_user_step_hook && kfunc_unregister_user_step_hook)) {
+        pr_err("wxshadow: neither direct hook nor register API available\n");
         return -1;
     }
-    pr_err("wxshadow: using direct brk_handler hook method\n");
-    pr_err("wxshadow: [9/12] done\n");
+    pr_info("wxshadow: [9/12] done\n");
 
     /* ===== Locking ===== */
     /* NOTE: mmap_lock and page_table_lock are NOT used - we operate locklessly */
@@ -303,10 +325,13 @@ int resolve_symbols(void)
         lookup_name_safe("__rcu_read_lock");
     kfunc_rcu_read_unlock = (typeof(kfunc_rcu_read_unlock))
         lookup_name_safe("__rcu_read_unlock");
+    kfunc_synchronize_rcu = (typeof(kfunc_synchronize_rcu))
+        lookup_name_safe("synchronize_rcu");
     if (!kfunc_rcu_read_lock || !kfunc_rcu_read_unlock) {
         pr_err("wxshadow: RCU functions not found\n");
         return -1;
     }
+    pr_info("wxshadow: synchronize_rcu = %px\n", kfunc_synchronize_rcu);
 
     /* ===== Memory allocation ===== */
     pr_info("wxshadow: [12/12] memory alloc...\n");

@@ -16,6 +16,7 @@
 #include <linux/kallsyms.h>
 #include <linux/sched.h>
 #include <linux/mm_types.h>
+#include <linux/rculist.h>
 /* init_task: use wx_init_task via kallsyms (framework doesn't export it) */
 #include <pgtable.h>
 #include <asm/current.h>
@@ -141,11 +142,19 @@ extern void (*kfunc_user_disable_single_step)(void *task);
 extern void *kfunc_brk_handler;
 extern void *kfunc_single_step_handler;
 
+/* register_user_*_hook API (fallback) */
+extern void (*kfunc_register_user_break_hook)(struct wx_break_hook *hook);
+extern void (*kfunc_unregister_user_break_hook)(struct wx_break_hook *hook);
+extern void (*kfunc_register_user_step_hook)(struct wx_step_hook *hook);
+extern void (*kfunc_unregister_user_step_hook)(struct wx_step_hook *hook);
+extern spinlock_t *kptr_debug_hook_lock;
+
 /* Locking - NOT USED (lockless operation) */
 
 /* RCU */
 extern void (*kfunc_rcu_read_lock)(void);
 extern void (*kfunc_rcu_read_unlock)(void);
+extern void (*kfunc_synchronize_rcu)(void);
 
 /* Memory allocation */
 extern void *(*kfunc_kzalloc)(size_t size, unsigned int flags);

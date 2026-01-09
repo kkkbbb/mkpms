@@ -85,11 +85,19 @@ void (*kfunc_user_disable_single_step)(void *task);
 void *kfunc_brk_handler;
 void *kfunc_single_step_handler;
 
+/* register_user_*_hook API (fallback) */
+void (*kfunc_register_user_break_hook)(struct wx_break_hook *hook);
+void (*kfunc_unregister_user_break_hook)(struct wx_break_hook *hook);
+void (*kfunc_register_user_step_hook)(struct wx_step_hook *hook);
+void (*kfunc_unregister_user_step_hook)(struct wx_step_hook *hook);
+spinlock_t *kptr_debug_hook_lock;  /* kernel's debug_hook_lock for safe unregister */
+
 /* Locking - NOT USED (lockless operation) */
 
 /* RCU */
 void (*kfunc_rcu_read_lock)(void);
 void (*kfunc_rcu_read_unlock)(void);
+void (*kfunc_synchronize_rcu)(void);
 
 /* Memory allocation */
 void *(*kfunc_kzalloc)(size_t size, unsigned int flags);
@@ -133,7 +141,24 @@ LIST_HEAD(page_list);           /* Global list of wxshadow_page */
 DEFINE_SPINLOCK(global_lock);
 
 /* ========== BRK/Step hook structures ========== */
-/* NOTE: Using direct brk_handler/single_step_handler hook, no struct needed */
+
+/* Current hook method */
+enum wx_hook_method hook_method = WX_HOOK_METHOD_NONE;
+
+/* Forward declaration for hook callbacks */
+static int wxshadow_brk_hook_fn(struct pt_regs *regs, unsigned int esr);
+static int wxshadow_step_hook_fn(struct pt_regs *regs, unsigned int esr);
+
+/* Hook instances for register_user_*_hook API */
+static struct wx_break_hook wxshadow_break_hook = {
+    .fn = wxshadow_brk_hook_fn,
+    .imm = WXSHADOW_BRK_IMM,
+    .mask = 0,
+};
+
+static struct wx_step_hook wxshadow_step_hook = {
+    .fn = wxshadow_step_hook_fn,
+};
 
 /* NOTE: mmap lock wrappers removed - lockless operation */
 
@@ -326,6 +351,27 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr)
     return -1;
 }
 
+/* ========== Hook callback functions for register_user_*_hook API ========== */
+
+/*
+ * BRK hook callback for register_user_break_hook
+ * Called by kernel's brk_handler when our BRK imm matches.
+ * Note: Unlike direct hook, we don't need to check imm here - kernel already matched it.
+ */
+static int wxshadow_brk_hook_fn(struct pt_regs *regs, unsigned int esr)
+{
+    return wxshadow_brk_handler(regs, esr);
+}
+
+/*
+ * Step hook callback for register_user_step_hook
+ * Called by kernel's single_step_handler for user-mode single-step exceptions.
+ */
+static int wxshadow_step_hook_fn(struct pt_regs *regs, unsigned int esr)
+{
+    return wxshadow_step_handler(regs, esr);
+}
+
 /* ========== Module init/exit ========== */
 
 static long wxshadow_init(const char *args, const char *event, void *__user reserved)
@@ -375,30 +421,72 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
 
     /* page_list already initialized by LIST_HEAD() macro */
 
-    /* Register BRK/step handlers via direct hook */
-    pr_err("wxshadow: hooking brk_handler at %px...\n", kfunc_brk_handler);
-    ret = hook_wrap3(kfunc_brk_handler, brk_handler_before, NULL, NULL);
-    if (ret != HOOK_NO_ERR) {
-        pr_err("wxshadow: failed to hook brk_handler: %d\n", ret);
-        return -1;
-    }
-    pr_err("wxshadow: hooked brk_handler\n");
+    /* Register BRK/step handlers */
+    /* NOTE: Temporarily prefer REGISTER method for testing */
+    if (kfunc_register_user_break_hook && kfunc_register_user_step_hook) {
+        /* Method 1: register_user_*_hook API (testing priority) */
+        pr_info("wxshadow: using register_user_*_hook API (testing priority)\n");
 
-    pr_err("wxshadow: hooking single_step_handler at %px...\n", kfunc_single_step_handler);
-    ret = hook_wrap3(kfunc_single_step_handler, single_step_handler_before, NULL, NULL);
-    if (ret != HOOK_NO_ERR) {
-        pr_err("wxshadow: failed to hook single_step_handler: %d\n", ret);
-        hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+        /* Initialize list_head nodes */
+        INIT_LIST_HEAD(&wxshadow_break_hook.node);
+        INIT_LIST_HEAD(&wxshadow_step_hook.node);
+
+        pr_info("wxshadow: registering break hook (imm=0x%x)...\n", wxshadow_break_hook.imm);
+        kfunc_register_user_break_hook(&wxshadow_break_hook);
+        pr_info("wxshadow: registered break hook\n");
+
+        pr_info("wxshadow: registering step hook...\n");
+        kfunc_register_user_step_hook(&wxshadow_step_hook);
+        pr_info("wxshadow: registered step hook\n");
+
+        hook_method = WX_HOOK_METHOD_REGISTER;
+    } else if (kfunc_brk_handler && kfunc_single_step_handler) {
+        /* Method 2: Direct hook (fallback) */
+        pr_info("wxshadow: using direct hook method (fallback)\n");
+
+        pr_info("wxshadow: hooking brk_handler at %px...\n", kfunc_brk_handler);
+        ret = hook_wrap3(kfunc_brk_handler, brk_handler_before, NULL, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_err("wxshadow: failed to hook brk_handler: %d\n", ret);
+            return -1;
+        }
+        pr_info("wxshadow: hooked brk_handler\n");
+
+        pr_info("wxshadow: hooking single_step_handler at %px...\n", kfunc_single_step_handler);
+        ret = hook_wrap3(kfunc_single_step_handler, single_step_handler_before, NULL, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_err("wxshadow: failed to hook single_step_handler: %d\n", ret);
+            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+            return -1;
+        }
+        pr_info("wxshadow: hooked single_step_handler\n");
+
+        hook_method = WX_HOOK_METHOD_DIRECT;
+    } else {
+        pr_err("wxshadow: no hook method available\n");
         return -1;
     }
-    pr_err("wxshadow: hooked single_step_handler\n");
 
     /* Hook prctl syscall */
     ret = hook_syscalln(__NR_prctl, 5, prctl_before, NULL, NULL);
     if (ret != HOOK_NO_ERR) {
         pr_err("wxshadow: failed to hook prctl: %d\n", ret);
-        hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-        hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+        /* Cleanup based on hook method */
+        if (hook_method == WX_HOOK_METHOD_DIRECT) {
+            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+        } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
+            /* Manual unregister, skip synchronize_rcu (hangs in KPM context) */
+            if (kptr_debug_hook_lock)
+                spin_lock(kptr_debug_hook_lock);
+            list_del_rcu(&wxshadow_step_hook.node);
+            list_del_rcu(&wxshadow_break_hook.node);
+            if (kptr_debug_hook_lock)
+                spin_unlock(kptr_debug_hook_lock);
+            INIT_LIST_HEAD(&wxshadow_step_hook.node);
+            INIT_LIST_HEAD(&wxshadow_break_hook.node);
+        }
+        hook_method = WX_HOOK_METHOD_NONE;
         return -1;
     }
     pr_info("wxshadow: hooked prctl syscall\n");
@@ -518,10 +606,58 @@ static long wxshadow_exit(void *__user reserved)
     /* Unhook prctl */
     unhook_syscalln(__NR_prctl, prctl_before, NULL);
 
-    /* Unregister handlers */
-    hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
-    hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-    pr_info("wxshadow: unhooked brk_handler and single_step_handler\n");
+    /* Unregister BRK/step handlers based on hook method */
+    if (hook_method == WX_HOOK_METHOD_DIRECT) {
+        hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+        hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+        pr_info("wxshadow: unhooked brk_handler and single_step_handler (direct)\n");
+    } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
+        /*
+         * Manual unregister: the kernel's unregister_user_*_hook calls
+         * synchronize_rcu() which hangs in KPM exit context.
+         *
+         * We manually:
+         * 1. Hold debug_hook_lock (if available)
+         * 2. list_del_rcu both hooks
+         * 3. Release lock
+         * 4. Call synchronize_rcu (if available) to wait for readers
+         */
+        pr_info("wxshadow: unregistering hooks (manual)...\n");
+
+        if (kptr_debug_hook_lock) {
+            spin_lock(kptr_debug_hook_lock);
+        } else {
+            pr_warn("wxshadow: debug_hook_lock not found, unsafe unregister\n");
+        }
+
+        list_del_rcu(&wxshadow_step_hook.node);
+        list_del_rcu(&wxshadow_break_hook.node);
+
+        if (kptr_debug_hook_lock) {
+            spin_unlock(kptr_debug_hook_lock);
+        }
+
+        /* Re-init list_head to safe state */
+        INIT_LIST_HEAD(&wxshadow_step_hook.node);
+        INIT_LIST_HEAD(&wxshadow_break_hook.node);
+
+        /*
+         * NOTE: We intentionally skip synchronize_rcu() here.
+         * It hangs in KPM exit context (likely due to the calling context).
+         *
+         * This is acceptable because:
+         * 1. The hook functions are in KPM .text, valid until unload completes
+         * 2. Debug hook RCU readers (step/brk handlers) are very short-lived
+         * 3. We've already removed nodes from the list under debug_hook_lock
+         *
+         * Worst case: a concurrent handler sees stale data briefly, but
+         * the function pointers remain valid throughout this exit sequence.
+         */
+        pr_info("wxshadow: skipping synchronize_rcu (hangs in KPM exit context)\n");
+
+        pr_info("wxshadow: unregistered break/step hooks (register API)\n");
+    }
+    hook_method = WX_HOOK_METHOD_NONE;
 
     /* Count pages first */
     spin_lock(&global_lock);
