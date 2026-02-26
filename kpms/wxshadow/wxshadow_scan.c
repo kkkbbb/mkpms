@@ -360,22 +360,7 @@ int resolve_symbols(void)
         pr_warn("wxshadow: copy_from_kernel_nofault not found, using direct access (less safe)\n");
     }
 
-    /* copy_from_user - needed for PATCH interface */
-    kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
-        lookup_name_safe("_copy_from_user");
-    if (!kfunc_copy_from_user) {
-        kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
-            lookup_name_safe("copy_from_user");
-    }
-    if (!kfunc_copy_from_user) {
-        kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
-            lookup_name_safe("__arch_copy_from_user");
-    }
-    if (kfunc_copy_from_user) {
-        pr_info("wxshadow: copy_from_user at %px\n", kfunc_copy_from_user);
-    } else {
-        pr_warn("wxshadow: copy_from_user not found, PATCH interface will be unavailable\n");
-    }
+    /* copy_from_user removed: PATCH uses PTE walk instead (see copy_from_user_via_pte) */
 
     /* ===== Page fault handler (optional) ===== */
     /*

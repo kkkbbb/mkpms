@@ -248,229 +248,181 @@ int wxshadow_do_set_reg(void *mm, unsigned long addr,
     return 0;
 }
 
+/* ========== User buffer read via PTE walk ========== */
+
+/*
+ * Read data from a user-space buffer by walking the caller's page tables.
+ *
+ * _copy_from_user is unreliable on some kernels (only copies first 4 bytes),
+ * so we bypass it: walk user page tables → find physical page → memcpy from
+ * kernel linear map.  Returns a kmalloc'd buffer on success, NULL on failure.
+ * Caller must kfunc_kfree() the returned buffer.
+ */
+static void *copy_from_user_via_pte(void __user *ubuf, unsigned long len)
+{
+    void *caller_mm;
+    unsigned long uaddr = (unsigned long)ubuf;
+    unsigned long buf_page = uaddr & PAGE_MASK;
+    unsigned long buf_off = uaddr & ~PAGE_MASK;
+    u64 *buf_pte;
+    unsigned long buf_pfn;
+    void *buf_kaddr, *kbuf;
+
+    if (buf_off + len > PAGE_SIZE) {
+        pr_err("wxshadow: user buffer %lx+%lu crosses page boundary\n", uaddr, len);
+        return NULL;
+    }
+
+    caller_mm = kfunc_get_task_mm(current);
+    if (!caller_mm)
+        return NULL;
+
+    buf_pte = get_user_pte(caller_mm, buf_page, NULL);
+    if (!buf_pte || !(*buf_pte & PTE_VALID)) {
+        pr_err("wxshadow: no PTE for user buffer %lx\n", uaddr);
+        kfunc_mmput(caller_mm);
+        return NULL;
+    }
+
+    buf_pfn = (*buf_pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
+    buf_kaddr = pfn_to_kaddr(buf_pfn);
+    if (!is_kva((unsigned long)buf_kaddr)) {
+        kfunc_mmput(caller_mm);
+        return NULL;
+    }
+
+    kbuf = kfunc_kzalloc(len, 0xcc0);
+    if (!kbuf) {
+        kfunc_mmput(caller_mm);
+        return NULL;
+    }
+
+    memcpy(kbuf, (char *)buf_kaddr + buf_off, len);
+    kfunc_mmput(caller_mm);
+    return kbuf;
+}
+
 /* ========== Patch: Write data to shadow page via kernel VA ========== */
 
 int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned long len)
 {
-    void *vma;
     struct wxshadow_page *page_info;
-    unsigned long shadow_vaddr;
-    void *orig_kaddr;
     unsigned long page_addr = addr & PAGE_MASK;
     unsigned long offset = addr & ~PAGE_MASK;
-    int ret = 0;
+    unsigned long shadow_vaddr, orig_pfn, shadow_pfn;
+    void *vma, *orig_kaddr, *patch_data;
     u64 *pte;
-    unsigned long orig_pfn, shadow_pfn;
-    u64 prot;
-    void *tmpbuf;
+    int ret;
 
     pr_info("wxshadow: [patch] addr=%lx len=%lu\n", addr, len);
 
-    /* Validate parameters */
     if (len == 0 || offset + len > PAGE_SIZE) {
-        pr_err("wxshadow: [patch] invalid len=%lu offset=%lu (must not cross page)\n",
-               len, offset);
+        pr_err("wxshadow: [patch] invalid len=%lu offset=%lu\n", len, offset);
         return -22;  /* EINVAL */
     }
-
-    /* Check TLB flush capability */
-    if (check_tlb_flush_capability() < 0) {
-        pr_err("wxshadow: [patch] no TLB flush method available!\n");
+    if (check_tlb_flush_capability() < 0)
         return -38;  /* ENOSYS */
-    }
 
-    /*
-     * Read user buffer via page table walk + kernel linear map.
-     * _copy_from_user is unreliable on some kernels (only copies 4 bytes),
-     * so we bypass it entirely by walking the user page tables to find the
-     * physical page backing the user buffer, then memcpy from kernel VA.
-     */
-    {
-        void *caller_mm = kfunc_get_task_mm(current);
-        unsigned long ubuf = (unsigned long)buf;
-        unsigned long buf_page = ubuf & PAGE_MASK;
-        unsigned long buf_off = ubuf & ~PAGE_MASK;
-        u64 *buf_pte;
-        unsigned long buf_pfn;
-        void *buf_kaddr;
+    /* Read user buffer into kernel memory via PTE walk */
+    patch_data = copy_from_user_via_pte(buf, len);
+    if (!patch_data)
+        return -14;  /* EFAULT */
 
-        if (!caller_mm) {
-            pr_err("wxshadow: [patch] cannot get caller mm\n");
-            return -3;
-        }
-
-        /* Validate buffer doesn't cross page boundary */
-        if (buf_off + len > PAGE_SIZE) {
-            pr_err("wxshadow: [patch] user buffer crosses page boundary\n");
-            kfunc_mmput(caller_mm);
-            return -14;
-        }
-
-        buf_pte = get_user_pte(caller_mm, buf_page, NULL);
-        if (!buf_pte || !(*buf_pte & PTE_VALID)) {
-            pr_err("wxshadow: [patch] cannot find PTE for user buffer %lx\n", ubuf);
-            kfunc_mmput(caller_mm);
-            return -14;
-        }
-
-        buf_pfn = (*buf_pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
-        buf_kaddr = pfn_to_kaddr(buf_pfn);
-
-        if (!is_kva((unsigned long)buf_kaddr)) {
-            pr_err("wxshadow: [patch] invalid kaddr for user buffer pfn %lx\n", buf_pfn);
-            kfunc_mmput(caller_mm);
-            return -14;
-        }
-
-        tmpbuf = kfunc_kzalloc ? kfunc_kzalloc(len, 0xcc0) : NULL;
-        if (!tmpbuf) {
-            pr_err("wxshadow: [patch] failed to alloc temp buffer\n");
-            kfunc_mmput(caller_mm);
-            return -12;
-        }
-
-        memcpy(tmpbuf, (char *)buf_kaddr + buf_off, len);
-        kfunc_mmput(caller_mm);
-
-        pr_info("wxshadow: [patch] read %lu bytes from user buf via PTE walk (pfn=%lx)\n",
-                len, buf_pfn);
-    }
-
-    /* Find VMA first (lockless) */
     vma = kfunc_find_vma(mm, addr);
     if (!vma || vma_start(vma) > addr) {
         pr_err("wxshadow: [patch] no vma for %lx\n", addr);
-        kfunc_kfree(tmpbuf);
-        return -1;
+        ret = -1;
+        goto out_free;
     }
 
-    /* Check if page already has shadow */
-    page_info = wxshadow_find_page(mm, page_addr);  /* caller ref if non-NULL */
+    /* Fast path: shadow already exists */
+    page_info = wxshadow_find_page(mm, page_addr);
     if (page_info && page_info->shadow_page) {
-        /* Shadow already exists, write patch data directly via memcpy */
         shadow_vaddr = (unsigned long)page_info->shadow_page;
-        memcpy((void *)(shadow_vaddr + offset), tmpbuf, len);
-
-        /* Clean dcache at kernel VA so data is visible at PoU */
+        memcpy((void *)(shadow_vaddr + offset), patch_data, len);
         wxshadow_flush_kern_dcache_area(shadow_vaddr, PAGE_SIZE);
 
-        /* If not already in SHADOW_X state, switch PTE */
         if (page_info->state != WX_STATE_SHADOW_X) {
-            prot = 0;  /* --x */
-            ret = wxshadow_switch_mapping(vma, page_addr, page_info->pfn_shadow, prot);
+            ret = wxshadow_switch_mapping(vma, page_addr, page_info->pfn_shadow, 0);
             if (ret == 0)
                 page_info->state = WX_STATE_SHADOW_X;
+        } else {
+            ret = 0;
         }
 
         wxshadow_flush_icache_page(page_addr);
-        pr_info("wxshadow: [patch] patched existing shadow at %lx+%lx (%lu bytes)\n",
+        pr_info("wxshadow: [patch] existing shadow %lx+%lx (%lu bytes)\n",
                 page_addr, offset, len);
-        kfunc_kfree(tmpbuf);
-        wxshadow_page_put(page_info);  /* release caller ref */
-        return ret;
+        wxshadow_page_put(page_info);
+        goto out_free;
     }
-
-    /* Page found but shadow_page is NULL: release spurious ref and fall through. */
     if (page_info) {
         wxshadow_page_put(page_info);
         page_info = NULL;
     }
 
-    /* No shadow yet - create one */
+    /* Slow path: create new shadow page */
     page_info = wxshadow_create_page(mm, page_addr);
-    if (!page_info) {
-        pr_err("wxshadow: [patch] failed to create page structure\n");
-        kfunc_kfree(tmpbuf);
-        return -12;  /* ENOMEM */
-    }
+    if (!page_info) { ret = -12; goto out_free; }
 
-    /* Get original page PFN from PTE (lockless) */
     pte = get_user_pte(mm, page_addr, NULL);
     if (!pte || !(*pte & PTE_VALID)) {
-        pr_err("wxshadow: [patch] no pte for %lx\n", page_addr);
-        kfunc_kfree(tmpbuf);
-        wxshadow_free_page(page_info);
-        return -14;
+        ret = -14;
+        goto out_free_page;
     }
     orig_pfn = (*pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
-
     page_info->pfn_original = orig_pfn;
     orig_kaddr = pfn_to_kaddr(orig_pfn);
+    if (!is_kva((unsigned long)orig_kaddr)) { ret = -14; goto out_free_page; }
 
-    /* Validate orig_kaddr is a valid kernel address */
-    if (!is_kva((unsigned long)orig_kaddr)) {
-        pr_err("wxshadow: [patch] invalid orig_kaddr %px for pfn %lx\n",
-               orig_kaddr, orig_pfn);
-        kfunc_kfree(tmpbuf);
-        wxshadow_free_page(page_info);
-        return -14;
-    }
-
-    /* Allocate shadow page (single page, order=0) */
+    /* Allocate shadow + backup pages */
     shadow_vaddr = kfunc___get_free_pages(0xcc0, 0);
-    if (!shadow_vaddr) {
-        pr_err("wxshadow: [patch] failed to allocate shadow page\n");
-        kfunc_kfree(tmpbuf);
-        wxshadow_free_page(page_info);
-        return -12;
-    }
-
-    shadow_pfn = kaddr_to_pfn(shadow_vaddr);
-    page_info->pfn_shadow = shadow_pfn;
+    if (!shadow_vaddr) { ret = -12; goto out_free_page; }
+    page_info->pfn_shadow = kaddr_to_pfn(shadow_vaddr);
     page_info->shadow_page = (void *)shadow_vaddr;
 
-    /* Allocate backup copy of original page */
     {
-        unsigned long backup_vaddr = kfunc___get_free_pages(0xcc0, 0);
-        if (!backup_vaddr) {
-            pr_err("wxshadow: [patch] failed to allocate orig_backup page\n");
-            kfunc_kfree(tmpbuf);
-            kfunc_free_pages(shadow_vaddr, 0);
-            page_info->shadow_page = NULL;
-            page_info->pfn_shadow = 0;
-            wxshadow_free_page(page_info);
-            return -12;
-        }
-        memcpy((void *)backup_vaddr, orig_kaddr, PAGE_SIZE);
-        page_info->orig_backup = (void *)backup_vaddr;
-        page_info->pfn_orig_backup = kaddr_to_pfn(backup_vaddr);
+        unsigned long backup = kfunc___get_free_pages(0xcc0, 0);
+        if (!backup) { ret = -12; goto out_free_shadow; }
+        memcpy((void *)backup, orig_kaddr, PAGE_SIZE);
+        page_info->orig_backup = (void *)backup;
+        page_info->pfn_orig_backup = kaddr_to_pfn(backup);
     }
 
-    /* Copy original to shadow */
+    /* Build shadow: original content + patch overlay */
     memcpy((void *)shadow_vaddr, orig_kaddr, PAGE_SIZE);
-
-    /* Write patch data from temp buffer to shadow via memcpy */
-    memcpy((void *)(shadow_vaddr + offset), tmpbuf, len);
-    kfunc_kfree(tmpbuf);
-    tmpbuf = NULL;
+    memcpy((void *)(shadow_vaddr + offset), patch_data, len);
 
     page_info->state = WX_STATE_SHADOW_X;
-    page_info->nr_bps = 0;  /* No breakpoints */
+    page_info->nr_bps = 0;
 
-    /* Clean dcache at kernel VA so data is visible at PoU for instruction fetch */
     wxshadow_flush_kern_dcache_area(shadow_vaddr, PAGE_SIZE);
 
-    /* Switch PTE to shadow page with --x permission */
-    prot = 0;  /* --x */
-    ret = wxshadow_switch_mapping(vma, page_addr, shadow_pfn, prot);
-
+    ret = wxshadow_switch_mapping(vma, page_addr, page_info->pfn_shadow, 0);
     if (ret == 0) {
         wxshadow_flush_icache_page(page_addr);
-        pr_info("wxshadow: [patch] created shadow at %lx+%lx (%lu bytes) orig_pfn=%lx shadow_pfn=%lx\n",
-                page_addr, offset, len, page_info->pfn_original, page_info->pfn_shadow);
+        pr_info("wxshadow: [patch] new shadow %lx+%lx (%lu bytes) pfn %lx->%lx\n",
+                page_addr, offset, len, orig_pfn, page_info->pfn_shadow);
     } else {
-        pr_err("wxshadow: [patch] switch failed\n");
-        kfunc_free_pages(shadow_vaddr, 0);
-        page_info->shadow_page = NULL;
-        page_info->pfn_shadow = 0;
-        if (page_info->orig_backup) {
-            kfunc_free_pages((unsigned long)page_info->orig_backup, 0);
-            page_info->orig_backup = NULL;
-            page_info->pfn_orig_backup = 0;
-        }
-        wxshadow_free_page(page_info);
+        goto out_free_shadow;
     }
 
+    kfunc_kfree(patch_data);
+    return 0;
+
+out_free_shadow:
+    kfunc_free_pages(shadow_vaddr, 0);
+    page_info->shadow_page = NULL;
+    page_info->pfn_shadow = 0;
+    if (page_info->orig_backup) {
+        kfunc_free_pages((unsigned long)page_info->orig_backup, 0);
+        page_info->orig_backup = NULL;
+        page_info->pfn_orig_backup = 0;
+    }
+out_free_page:
+    wxshadow_free_page(page_info);
+out_free:
+    kfunc_kfree(patch_data);
     return ret;
 }
 

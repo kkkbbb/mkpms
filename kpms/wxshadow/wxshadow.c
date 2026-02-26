@@ -98,9 +98,6 @@ void (*kfunc_kfree)(void *ptr);
 /* Safe memory access */
 long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 
-/* User memory access */
-unsigned long (*kfunc_copy_from_user)(void *to, const void __user *from, unsigned long n);
-
 /* do_page_fault hook */
 void *kfunc_do_page_fault = NULL;
 
