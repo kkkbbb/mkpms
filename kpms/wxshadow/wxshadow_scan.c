@@ -98,13 +98,6 @@ int resolve_symbols(void)
         return -1;
     }
 
-    pr_info("wxshadow: [4/12] page refcount...\n");
-    kfunc_put_page = (typeof(kfunc_put_page))lookup_name_safe("__put_page");
-    if (!kfunc_put_page) {
-        kfunc_put_page = (typeof(kfunc_put_page))lookup_name_safe("put_page");
-    }
-    kfunc_get_page = (typeof(kfunc_get_page))lookup_name_safe("get_page");
-
     /* ===== Address translation ===== */
     pr_info("wxshadow: [5/12] address translation...\n");
     kvar_memstart_addr = (s64 *)lookup_name_safe("memstart_addr");
@@ -238,10 +231,6 @@ int resolve_symbols(void)
         }
     }
 
-    /* Optional: icache sync for set_pte_at */
-    kfunc___sync_icache_dcache = (typeof(kfunc___sync_icache_dcache))
-        lookup_name_safe("__sync_icache_dcache");
-
     /* ===== Cache operations ===== */
     pr_info("wxshadow: [7/12] cache ops...\n");
     RESOLVE_SYMBOL(flush_dcache_page);
@@ -290,17 +279,11 @@ int resolve_symbols(void)
     /* Register API symbols */
     kfunc_register_user_break_hook = (typeof(kfunc_register_user_break_hook))
         lookup_name_safe("register_user_break_hook");
-    kfunc_unregister_user_break_hook = (typeof(kfunc_unregister_user_break_hook))
-        lookup_name_safe("unregister_user_break_hook");
     kfunc_register_user_step_hook = (typeof(kfunc_register_user_step_hook))
         lookup_name_safe("register_user_step_hook");
-    kfunc_unregister_user_step_hook = (typeof(kfunc_unregister_user_step_hook))
-        lookup_name_safe("unregister_user_step_hook");
 
     pr_info("wxshadow: register_user_break_hook = %px\n", kfunc_register_user_break_hook);
-    pr_info("wxshadow: unregister_user_break_hook = %px\n", kfunc_unregister_user_break_hook);
     pr_info("wxshadow: register_user_step_hook = %px\n", kfunc_register_user_step_hook);
-    pr_info("wxshadow: unregister_user_step_hook = %px\n", kfunc_unregister_user_step_hook);
 
     /* debug_hook_lock for safe manual unregister */
     kptr_debug_hook_lock = (spinlock_t *)lookup_name_safe("debug_hook_lock");
@@ -308,8 +291,7 @@ int resolve_symbols(void)
 
     /* Check if at least one method is available */
     if (!(kfunc_brk_handler && kfunc_single_step_handler) &&
-        !(kfunc_register_user_break_hook && kfunc_unregister_user_break_hook &&
-          kfunc_register_user_step_hook && kfunc_unregister_user_step_hook)) {
+        !(kfunc_register_user_break_hook && kfunc_register_user_step_hook)) {
         pr_err("wxshadow: neither direct hook nor register API available\n");
         return -1;
     }
@@ -378,6 +360,23 @@ int resolve_symbols(void)
         pr_warn("wxshadow: copy_from_kernel_nofault not found, using direct access (less safe)\n");
     }
 
+    /* copy_from_user - needed for PATCH interface */
+    kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
+        lookup_name_safe("_copy_from_user");
+    if (!kfunc_copy_from_user) {
+        kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
+            lookup_name_safe("copy_from_user");
+    }
+    if (!kfunc_copy_from_user) {
+        kfunc_copy_from_user = (typeof(kfunc_copy_from_user))
+            lookup_name_safe("__arch_copy_from_user");
+    }
+    if (kfunc_copy_from_user) {
+        pr_info("wxshadow: copy_from_user at %px\n", kfunc_copy_from_user);
+    } else {
+        pr_warn("wxshadow: copy_from_user not found, PATCH interface will be unavailable\n");
+    }
+
     /* ===== Page fault handler (optional) ===== */
     /*
      * Use lookup_name_safe() to avoid module traversal hang.
@@ -406,56 +405,6 @@ int resolve_symbols(void)
 }
 
 /* ========== mm_struct offset scanning ========== */
-
-static inline bool is_kernel_addr(unsigned long addr)
-{
-    return addr >= page_offset_base && addr < 0xffffffffffffffffUL;
-}
-
-static inline bool is_kva(unsigned long addr)
-{
-    return (addr >> 48) == 0xffff;
-}
-
-/*
- * Safe memory read helpers using copy_from_kernel_nofault.
- * These functions return false if the address is invalid or unreadable,
- * preventing kernel panics during offset scanning.
- */
-
-static inline bool safe_read_u64(unsigned long addr, u64 *out)
-{
-    if (!is_kva(addr))
-        return false;
-
-    if (kfunc_copy_from_kernel_nofault) {
-        if (kfunc_copy_from_kernel_nofault(out, (const void *)addr, sizeof(*out)) != 0)
-            return false;
-    } else {
-        /* Fallback: direct access (less safe) */
-        *out = *(u64 *)addr;
-    }
-    return true;
-}
-
-static inline bool safe_read_ptr(unsigned long addr, void **out)
-{
-    return safe_read_u64(addr, (u64 *)out);
-}
-
-static inline bool safe_read_u32(unsigned long addr, u32 *out)
-{
-    if (!is_kva(addr))
-        return false;
-
-    if (kfunc_copy_from_kernel_nofault) {
-        if (kfunc_copy_from_kernel_nofault(out, (const void *)addr, sizeof(*out)) != 0)
-            return false;
-    } else {
-        *out = *(u32 *)addr;
-    }
-    return true;
-}
 
 /* Check if a kernel address is valid and readable */
 static inline bool is_valid_kptr(unsigned long addr)

@@ -35,7 +35,6 @@ KPM_DESCRIPTION("W^X Shadow Memory - Hidden Breakpoint Mechanism");
 void *(*kfunc_find_vma)(void *mm, unsigned long addr);
 void *(*kfunc_get_task_mm)(void *task);
 void (*kfunc_mmput)(void *mm);
-void (*kfunc_mmget)(void *mm);
 /* find_task_by_vpid: use find_task_by_vpid() from linux/sched.h */
 
 /* exit_mmap hook */
@@ -44,8 +43,6 @@ void *kfunc_exit_mmap = NULL;
 /* Page allocation */
 unsigned long (*kfunc___get_free_pages)(unsigned int gfp_mask, unsigned int order);
 void (*kfunc_free_pages)(unsigned long addr, unsigned int order);
-void (*kfunc_get_page)(void *page);
-void (*kfunc_put_page)(void *page);
 
 /* Address translation */
 s64 *kvar_memstart_addr;
@@ -53,9 +50,6 @@ s64 *kvar_physvirt_offset;
 unsigned long page_offset_base;
 s64 detected_physvirt_offset;
 int physvirt_offset_valid = 0;
-
-/* GFP_KERNEL value */
-unsigned int detected_gfp_kernel = 0;
 
 /* Page table config */
 int wx_page_shift;
@@ -73,7 +67,6 @@ pid_t wxfunc_def(__task_pid_nr_ns)(struct task_struct *task, enum pid_type type,
 struct task_struct *wx_init_task = 0;
 
 /* Cache operations */
-void (*kfunc___sync_icache_dcache)(u64 pte);
 void (*kfunc_flush_dcache_page)(void *page);
 void (*kfunc___flush_icache_range)(unsigned long start, unsigned long end);
 
@@ -87,9 +80,7 @@ void *kfunc_single_step_handler;
 
 /* register_user_*_hook API (fallback) */
 void (*kfunc_register_user_break_hook)(struct wx_break_hook *hook);
-void (*kfunc_unregister_user_break_hook)(struct wx_break_hook *hook);
 void (*kfunc_register_user_step_hook)(struct wx_step_hook *hook);
-void (*kfunc_unregister_user_step_hook)(struct wx_step_hook *hook);
 spinlock_t *kptr_debug_hook_lock;  /* kernel's debug_hook_lock for safe unregister */
 
 /* Locking - NOT USED (lockless operation) */
@@ -107,14 +98,15 @@ void (*kfunc_kfree)(void *ptr);
 /* Safe memory access */
 long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 
-/* rmap operations (optional) */
-void (*kfunc_page_remove_rmap)(void *page, bool compound);
-void (*kfunc_page_add_anon_rmap)(void *page, void *vma, unsigned long addr, bool compound);
-void (*kfunc_page_add_new_anon_rmap)(void *page, void *vma, unsigned long addr, bool compound);
-void (*kfunc_page_add_file_rmap)(void *page, bool compound);
+/* User memory access */
+unsigned long (*kfunc_copy_from_user)(void *to, const void __user *from, unsigned long n);
 
 /* do_page_fault hook */
 void *kfunc_do_page_fault = NULL;
+
+/* copy_process hook (fork protection) */
+void *kfunc_copy_process = NULL;
+void *kfunc_cgroup_post_fork = NULL;
 
 /* TLB flush */
 void (*kfunc_flush_tlb_page)(void *vma, unsigned long uaddr);
@@ -125,20 +117,26 @@ void (*kfunc___flush_tlb_range)(void *vma, unsigned long start, unsigned long en
 
 int16_t vma_vm_mm_offset = -1;
 /* mm_pgd_offset: use mm_struct_offset.pgd_offset from KP framework */
-int16_t mm_mmap_offset = 0x00;
 /* NOTE: mm_page_table_lock_offset and mm_mmap_lock_offset_dyn removed (lockless) */
 
 /* mm->context.id offset for ASID (detected at runtime, -1 = not detected) */
 int16_t mm_context_id_offset = -1;
 
 /* TLB flush mode (default: auto) */
-int tlb_flush_mode = WX_TLB_MODE_BROADCAST;
+int tlb_flush_mode = WX_TLB_MODE_PRECISE;
 
 /* ========== Global state ========== */
 
 /* Use KP framework's list_head and spinlock_t */
 LIST_HEAD(page_list);           /* Global list of wxshadow_page */
 DEFINE_SPINLOCK(global_lock);
+
+/*
+ * In-flight handler counter — see wxshadow_internal.h for rationale.
+ * KP calls kp_free_exec() immediately after exit() returns, so we must
+ * ensure no module code is executing before we return from exit().
+ */
+atomic_t wx_in_flight = ATOMIC_INIT(0);
 
 /* ========== BRK/Step hook structures ========== */
 
@@ -162,10 +160,31 @@ static struct wx_step_hook wxshadow_step_hook = {
 
 /* NOTE: mmap lock wrappers removed - lockless operation */
 
+/* ========== Reference counting helpers ========== */
+
+/*
+ * wxshadow_page_put - release one reference.
+ * kfree's the struct when refcount reaches zero.
+ * Acquires global_lock internally; safe from any context.
+ */
+void wxshadow_page_put(struct wxshadow_page *page)
+{
+    int should_free;
+
+    spin_lock(&global_lock);
+    should_free = (--page->refcount == 0);
+    spin_unlock(&global_lock);
+
+    if (should_free)
+        kfunc_kfree(page);
+}
+
 /* ========== Helper functions ========== */
 
 /*
- * Find page by mm and address
+ * Find page by mm and address.
+ * Returns page with refcount incremented (caller must wxshadow_page_put).
+ * Returns NULL if not found (no ref taken).
  */
 struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr)
 {
@@ -177,6 +196,7 @@ struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr)
     list_for_each(pos, &page_list) {
         page = container_of(pos, struct wxshadow_page, list);
         if (page->mm == mm && page->page_addr == target_addr) {
+            page->refcount++;          /* caller's reference */
             spin_unlock(&global_lock);
             return page;
         }
@@ -200,6 +220,8 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
     page->mm = mm;
     page->page_addr = page_addr;
     page->state = WX_STATE_NONE;
+    page->refcount = 1;            /* list's reference */
+    page->dead = false;
     INIT_LIST_HEAD(&page->list);
 
     spin_lock(&global_lock);
@@ -211,25 +233,40 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
 }
 
 /*
- * Free a page structure and remove from list
+ * Free a page structure and remove from list.
+ * Must be called only when no external caller ref exists (refcount == 1,
+ * i.e. only the list's ref).  Used in error paths after wxshadow_create_page.
  */
 void wxshadow_free_page(struct wxshadow_page *page)
 {
     unsigned long shadow_vaddr = 0;
+    unsigned long backup_vaddr = 0;
 
     if (!page)
         return;
 
+    /* Capture shadow/backup pointers and mark dead under lock to prevent double-free
+     * races with exit_mmap_before or the exit loop. */
     spin_lock(&global_lock);
+    page->dead = true;
     list_del_init(&page->list);
-    if (page->shadow_page)
+    if (page->shadow_page) {
         shadow_vaddr = (unsigned long)page->shadow_page;
+        page->shadow_page = NULL;
+    }
+    if (page->orig_backup) {
+        backup_vaddr = (unsigned long)page->orig_backup;
+        page->orig_backup = NULL;
+    }
     spin_unlock(&global_lock);
 
     if (shadow_vaddr)
         kfunc_free_pages(shadow_vaddr, 0);
+    if (backup_vaddr)
+        kfunc_free_pages(backup_vaddr, 0);
 
-    kfunc_kfree(page);
+    /* Release the list's ref (refcount was 1 → 0 → kfree). */
+    wxshadow_page_put(page);
 }
 
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long pc)
@@ -280,6 +317,13 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
         }
     }
 
+    if (page_info->pfn_orig_backup && current_pfn == page_info->pfn_orig_backup) {
+        if (page_info->state == WX_STATE_ORIGINAL ||
+            page_info->state == WX_STATE_STEPPING) {
+            return 1;
+        }
+    }
+
     pr_info("wxshadow: validate_mapping: PFN mismatch for addr %lx: "
             "current=%lx, orig=%lx, shadow=%lx, state=%d\n",
             page_addr, current_pfn, page_info->pfn_original,
@@ -287,9 +331,27 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
     return 0;
 }
 
+/*
+ * wxshadow_auto_cleanup_page - emergency cleanup called from handlers.
+ *
+ * The caller MUST already hold a reference (obtained via find_page or
+ * find_by_addr).  This function:
+ *   1. Marks the page dead and captures the shadow_page pointer under
+ *      global_lock — preventing a concurrent exit-loop or exit_mmap path
+ *      from double-freeing the shadow.
+ *   2. Removes the page from page_list and releases the LIST's reference
+ *      via wxshadow_page_put().
+ *   3. The CALLER must call wxshadow_page_put() afterwards to release its
+ *      own reference.
+ *
+ * NOTE: This function does NOT restore the PTE.  The caller is responsible
+ * for any PTE restoration before calling here (or accepting that the mapping
+ * will be cleaned up by the OS as part of the faulting path).
+ */
 int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
 {
     unsigned long shadow_vaddr = 0;
+    unsigned long backup_vaddr = 0;
     int i;
 
     if (!page)
@@ -304,6 +366,10 @@ int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
     pr_info("wxshadow:   PFN shadow: 0x%lx\n", page->pfn_shadow);
 
     spin_lock(&global_lock);
+
+    /* Mark dead so concurrent step-handlers skip the shadow PTE switch. */
+    page->dead = true;
+
     for (i = 0; i < page->nr_bps; i++) {
         if (page->bps[i].active) {
             pr_info("wxshadow:   Removing BP at 0x%lx\n", page->bps[i].addr);
@@ -318,10 +384,17 @@ int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
         page->stepping_task = NULL;
     }
 
-    if (page->shadow_page)
+    /* Capture and NULL shadow_page/orig_backup under lock to prevent double-free. */
+    if (page->shadow_page) {
         shadow_vaddr = (unsigned long)page->shadow_page;
+        page->shadow_page = NULL;
+    }
+    if (page->orig_backup) {
+        backup_vaddr = (unsigned long)page->orig_backup;
+        page->orig_backup = NULL;
+    }
 
-    /* Remove page from list */
+    /* Remove from list while holding lock. */
     list_del_init(&page->list);
     spin_unlock(&global_lock);
 
@@ -329,8 +402,14 @@ int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
         kfunc_free_pages(shadow_vaddr, 0);
         pr_info("wxshadow:   Freed shadow page\n");
     }
+    if (backup_vaddr) {
+        kfunc_free_pages(backup_vaddr, 0);
+        pr_info("wxshadow:   Freed orig_backup page\n");
+    }
 
-    kfunc_kfree(page);
+    /* Release the list's reference.  The caller still holds its own
+     * reference and must call wxshadow_page_put() when done. */
+    wxshadow_page_put(page);
 
     pr_info("wxshadow: ===============================================\n");
     return 0;
@@ -340,13 +419,20 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page;
 
-    page = wxshadow_find_page(mm, addr);
-    if (!page || page->state == WX_STATE_NONE)
+    page = wxshadow_find_page(mm, addr);  /* caller ref */
+    if (!page)
         return -1;
+
+    if (page->state == WX_STATE_NONE) {
+        wxshadow_page_put(page);
+        return -1;
+    }
 
     pr_info("wxshadow: write fault at %lx - page content changing\n", addr);
 
+    /* auto_cleanup releases the list ref; we release the caller ref below. */
     wxshadow_auto_cleanup_page(page, "Write Fault (page modified)");
+    wxshadow_page_put(page);   /* release caller ref */
 
     return -1;
 }
@@ -370,6 +456,30 @@ static int wxshadow_brk_hook_fn(struct pt_regs *regs, unsigned int esr)
 static int wxshadow_step_hook_fn(struct pt_regs *regs, unsigned int esr)
 {
     return wxshadow_step_handler(regs, esr);
+}
+
+/* ========== Unload helpers ========== */
+
+/*
+ * wx_unregister_brk_step_hooks - remove break/step hooks from kernel's
+ * debug hook lists under debug_hook_lock.  Safe to call from both the
+ * init failure path and wxshadow_exit().
+ * NOTE: caller must NOT call synchronize_rcu() — KP holds rcu_read_lock
+ * while invoking module exit, which would deadlock.
+ */
+static void wx_unregister_brk_step_hooks(void)
+{
+    if (kptr_debug_hook_lock) {
+        spin_lock(kptr_debug_hook_lock);
+    } else {
+        pr_warn("wxshadow: debug_hook_lock not found, unsafe unregister\n");
+    }
+    list_del_rcu(&wxshadow_step_hook.node);
+    list_del_rcu(&wxshadow_break_hook.node);
+    if (kptr_debug_hook_lock)
+        spin_unlock(kptr_debug_hook_lock);
+    INIT_LIST_HEAD(&wxshadow_step_hook.node);
+    INIT_LIST_HEAD(&wxshadow_break_hook.node);
 }
 
 /* ========== Module init/exit ========== */
@@ -476,15 +586,7 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
             hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
             hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
         } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
-            /* Manual unregister, skip synchronize_rcu (hangs in KPM context) */
-            if (kptr_debug_hook_lock)
-                spin_lock(kptr_debug_hook_lock);
-            list_del_rcu(&wxshadow_step_hook.node);
-            list_del_rcu(&wxshadow_break_hook.node);
-            if (kptr_debug_hook_lock)
-                spin_unlock(kptr_debug_hook_lock);
-            INIT_LIST_HEAD(&wxshadow_step_hook.node);
-            INIT_LIST_HEAD(&wxshadow_break_hook.node);
+            wx_unregister_brk_step_hooks();
         }
         hook_method = WX_HOOK_METHOD_NONE;
         return -1;
@@ -515,10 +617,45 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         }
     }
 
+    /* Hook copy_process for fork protection (optional) */
+    if (patch_config) {
+        unsigned long cp_addr = patch_config->copy_process;
+        unsigned long cpf_addr = patch_config->cgroup_post_fork;
+        if (cp_addr) {
+            kfunc_copy_process = (void *)cp_addr;
+            ret = hook_wrap8(kfunc_copy_process, NULL, after_copy_process_wx, NULL);
+            if (ret != HOOK_NO_ERR) {
+                pr_warn("wxshadow: failed to hook copy_process: %d\n", ret);
+                kfunc_copy_process = NULL;
+            } else {
+                pr_info("wxshadow: hooked copy_process at %px for fork protection\n",
+                        kfunc_copy_process);
+            }
+        }
+        if (!kfunc_copy_process && cpf_addr) {
+            kfunc_cgroup_post_fork = (void *)cpf_addr;
+            ret = hook_wrap4(kfunc_cgroup_post_fork, NULL, after_cgroup_post_fork_wx, NULL);
+            if (ret != HOOK_NO_ERR) {
+                pr_warn("wxshadow: failed to hook cgroup_post_fork: %d\n", ret);
+                kfunc_cgroup_post_fork = NULL;
+            } else {
+                pr_info("wxshadow: hooked cgroup_post_fork at %px for fork protection\n",
+                        kfunc_cgroup_post_fork);
+            }
+        }
+        if (!kfunc_copy_process && !kfunc_cgroup_post_fork) {
+            pr_warn("wxshadow: fork protection DISABLED (no copy_process/cgroup_post_fork)\n");
+        }
+    } else {
+        pr_warn("wxshadow: patch_config not available, fork protection DISABLED\n");
+    }
+
     pr_info("wxshadow: W^X shadow memory module loaded\n");
     pr_info("wxshadow: use prctl(0x%x, pid, addr) to set breakpoint\n", PR_WXSHADOW_SET_BP);
     pr_info("wxshadow: use prctl(0x%x, pid, addr, reg, val) to set reg mod\n", PR_WXSHADOW_SET_REG);
     pr_info("wxshadow: use prctl(0x%x, pid, addr) to delete breakpoint\n", PR_WXSHADOW_DEL_BP);
+    pr_info("wxshadow: use prctl(0x%x, pid, addr, buf, len) to patch shadow\n", PR_WXSHADOW_PATCH);
+    pr_info("wxshadow: use prctl(0x%x, pid, addr) to release shadow\n", PR_WXSHADOW_RELEASE);
     if (kfunc_do_page_fault) {
         pr_info("wxshadow: read hiding ENABLED (do_page_fault hooked)\n");
     } else {
@@ -532,178 +669,266 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
 }
 
 /*
- * wxshadow_cleanup_page - fully cleanup a page (restore mapping, free resources)
- * Called during module unload. Must be called WITHOUT global_lock held.
+ * wxshadow_cleanup_page - fully cleanup a page (restore mapping, free resources).
+ *
+ * Called during module unload.  The page has already been removed from
+ * page_list by the exit loop (list_del_init under global_lock), so no new
+ * handler will find it via find_page / find_by_addr.  However a handler that
+ * found the page BEFORE the list removal may still hold a caller ref and be
+ * running concurrently.
+ *
+ * Protocol:
+ *   1. Mark page dead and capture shadow_page under global_lock.
+ *      - Prevents double-free of shadow with concurrent auto_cleanup_page.
+ *      - The dead flag tells any concurrent step-handler to skip the
+ *        switch-to-shadow PTE operation.
+ *   2. Disable single-step on the stepping task if present.
+ *   3. If the page was in STEPPING state, spin briefly so that a concurrent
+ *      step-handler that already read dead=false has time to complete its
+ *      switch-to-shadow before we override with switch-to-original.  After
+ *      our switch the PTE is at original; the step-handler's earlier switch
+ *      (if it happened) is overridden, and our TLB flush ensures no stale
+ *      shadow-page references survive.
+ *   4. Restore original PTE (for SHADOW_X / ORIGINAL / STEPPING states).
+ *   5. Free shadow page.
+ *   6. Release the list's reference via wxshadow_page_put().  If a handler
+ *      still holds a ref the struct stays alive until the handler's put.
  */
 static void wxshadow_cleanup_page(struct wxshadow_page *page)
 {
     void *mm = page->mm;
+    void *stepping;
     void *vma = NULL;
+    int state;
+    unsigned long shadow_vaddr = 0;
+    unsigned long backup_vaddr = 0;
+    u64 probe;
+
+    /* --- Step 1: mark dead, capture shadow/backup, clear stepping_task --- */
+    spin_lock(&global_lock);
+    page->dead = true;
+    state = page->state;
+    stepping = page->stepping_task;
+    page->stepping_task = NULL;
+    if (page->shadow_page) {
+        shadow_vaddr = (unsigned long)page->shadow_page;
+        page->shadow_page = NULL;
+    }
+    if (page->orig_backup) {
+        backup_vaddr = (unsigned long)page->orig_backup;
+        page->orig_backup = NULL;
+    }
+    spin_unlock(&global_lock);
 
     pr_info("wxshadow: cleanup page addr=%lx state=%d stepping_task=%px\n",
-            page->page_addr, page->state, page->stepping_task);
+            page->page_addr, state, stepping);
 
-    /* Disable single step if task is stepping */
-    if (page->stepping_task && kfunc_user_disable_single_step) {
-        pr_info("wxshadow: disabling single step for task %px\n", page->stepping_task);
-        kfunc_user_disable_single_step(page->stepping_task);
-        page->stepping_task = NULL;
-    }
-
-    /* Try to get VMA for restoring page table mappings */
-    if (mm && kfunc_find_vma) {
-        vma = kfunc_find_vma(mm, page->page_addr);
-        if (vma && vma_start(vma) > page->page_addr)
-            vma = NULL;
-    }
-
-    /* Restore original page mapping if possible */
-    if (vma && page->pfn_original &&
-        (page->state == WX_STATE_SHADOW_X || page->state == WX_STATE_STEPPING)) {
-        /* Restore to original page with r-x permission */
-        u64 prot = PTE_USER | PTE_RDONLY;  /* r-x */
-        int ret = wxshadow_switch_mapping(vma, page->page_addr, page->pfn_original, prot);
-        if (ret == 0) {
-            pr_info("wxshadow: restored original mapping for addr=%lx pfn=%lx\n",
-                    page->page_addr, page->pfn_original);
-            wxshadow_flush_icache_page(page->page_addr);
+    /* --- Step 2: disable single-step --- */
+    if (stepping && kfunc_user_disable_single_step) {
+        if (is_kva((unsigned long)stepping) &&
+            safe_read_u64((unsigned long)stepping, &probe)) {
+            pr_info("wxshadow: disabling single step for task %px\n", stepping);
+            kfunc_user_disable_single_step(stepping);
         } else {
-            pr_warn("wxshadow: failed to restore mapping for addr=%lx\n", page->page_addr);
+            pr_warn("wxshadow: stepping_task %px is stale, skipping disable\n", stepping);
         }
     }
 
-    /* Free shadow page */
-    if (page->shadow_page) {
-        kfunc_free_pages((unsigned long)page->shadow_page, 0);
-        pr_info("wxshadow: freed shadow page for addr=%lx\n", page->page_addr);
+    /* --- Step 3: brief spin for any concurrent step-handler --- */
+    if (state == WX_STATE_STEPPING) {
+        /*
+         * A step-handler that read dead=false before Step 1 may be about to
+         * switch PTE to shadow.  We spin briefly so it can complete that
+         * switch; then our switch-to-original below overrides it and the
+         * subsequent TLB flush ensures no CPU executes from the (soon freed)
+         * shadow page.
+         */
+        int w;
+        for (w = 0; w < 50000; w++)
+            cpu_relax();
     }
 
-    kfunc_kfree(page);
+    /* --- Step 4: restore original PTE --- */
+    if (mm && kfunc_find_vma && page->pfn_original) {
+        if (is_kva((unsigned long)mm) &&
+            safe_read_u64((unsigned long)mm, &probe)) {
+            vma = kfunc_find_vma(mm, page->page_addr);
+            if (vma && vma_start(vma) <= page->page_addr) {
+                u64 prot = PTE_USER | PTE_RDONLY;  /* r-x */
+                int ret = wxshadow_switch_mapping(vma, page->page_addr,
+                                                  page->pfn_original, prot);
+                if (ret == 0) {
+                    pr_info("wxshadow: restored original mapping addr=%lx pfn=%lx state=%d\n",
+                            page->page_addr, page->pfn_original, state);
+                    wxshadow_flush_icache_page(page->page_addr);
+                } else {
+                    pr_warn("wxshadow: failed to restore mapping for addr=%lx\n",
+                            page->page_addr);
+                }
+            }
+        } else {
+            pr_warn("wxshadow: mm %px is stale, skipping mapping restore\n", mm);
+        }
+    }
+
+    /* --- Step 5: free shadow page and orig_backup --- */
+    if (shadow_vaddr) {
+        kfunc_free_pages(shadow_vaddr, 0);
+        pr_info("wxshadow: freed shadow page for addr=%lx\n", page->page_addr);
+    }
+    if (backup_vaddr) {
+        kfunc_free_pages(backup_vaddr, 0);
+        pr_info("wxshadow: freed orig_backup page for addr=%lx\n", page->page_addr);
+    }
+
+    /* --- Step 6: release list's reference --- */
+    wxshadow_page_put(page);
+}
+
+/*
+ * wait_for_handlers_drain - spin until all in-flight handlers complete.
+ *
+ * Called after unhooking each set of handlers.  Because KP calls
+ * kp_free_exec(mod->start) immediately after exit() returns, we MUST
+ * ensure no module code is executing before we return.
+ *
+ * Steps:
+ *  1. Short busy-wait (200 K iterations, ~200 µs): covers the narrow window
+ *     between a CPU obtaining the fn pointer from the hook list (via
+ *     rcu_dereference) and calling WX_HANDLER_ENTER().  ARM64 BRK/step
+ *     handlers run with IRQs disabled, so this window is < 10 CPU cycles;
+ *     200 K cpu_relax cycles is more than sufficient.
+ *  2. Wait for wx_in_flight counter to reach 0: ensures any handler that
+ *     already incremented the counter has fully decremented it (i.e. has
+ *     returned from the module function).
+ *  3. Up to ~1 s timeout with a warning if something is stuck.
+ */
+static void wait_for_handlers_drain(const char *phase)
+{
+    int i, iters = 0;
+
+    /* Step 1: cover the "fn obtained but not yet entered handler" window */
+    for (i = 0; i < 200000; i++)
+        cpu_relax();
+
+    /* Step 2: wait for all active handlers to finish */
+    while (atomic_read(&wx_in_flight) > 0) {
+        cpu_relax();
+        if (++iters > 10000000) {
+            pr_warn("wxshadow: [%s] timeout waiting for in-flight handlers "
+                    "(in_flight=%d)\n", phase, atomic_read(&wx_in_flight));
+            break;
+        }
+    }
+
+    if (iters > 0)
+        pr_info("wxshadow: [%s] drained in-flight handlers (%d iters)\n",
+                phase, iters);
 }
 
 static long wxshadow_exit(void *__user reserved)
 {
-    struct list_head *pos, *n;
     struct wxshadow_page *page;
-    struct wxshadow_page **pages_to_free = NULL;
     int page_count = 0;
-    int i;
 
     pr_info("wxshadow: unloading...\n");
 
-    /* Unhook do_page_fault first */
-    if (kfunc_do_page_fault) {
-        hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
-        pr_info("wxshadow: unhooked do_page_fault\n");
-    }
-
-    /* Unhook exit_mmap */
-    if (kfunc_exit_mmap) {
-        hook_unwrap(kfunc_exit_mmap, exit_mmap_before, NULL);
-        pr_info("wxshadow: unhooked exit_mmap\n");
-    }
-
-    /* Unhook prctl */
+    /*
+     * Phase 1: Unhook prctl to block new user operations.
+     * BRK/step/fault/exit_mmap hooks remain active throughout Phase 2
+     * to handle any in-flight operations while pages are being cleaned.
+     */
     unhook_syscalln(__NR_prctl, prctl_before, NULL);
+    pr_info("wxshadow: unhooked prctl (phase 1)\n");
 
-    /* Unregister BRK/step handlers based on hook method */
+    /*
+     * Phase 2: Iteratively pop and clean every page from page_list.
+     * exit_mmap_before is still active to handle concurrent process exits;
+     * it will compete with this loop via global_lock — whoever calls
+     * list_del_init first owns the page.
+     * BRK/step handlers are still active and will find no page once
+     * it has been popped here.
+     */
+    while (1) {
+        spin_lock(&global_lock);
+        if (list_empty(&page_list)) {
+            spin_unlock(&global_lock);
+            break;
+        }
+        page = list_first_entry(&page_list, struct wxshadow_page, list);
+        list_del_init(&page->list);
+        spin_unlock(&global_lock);
+
+        wxshadow_cleanup_page(page);
+        page_count++;
+    }
+    pr_info("wxshadow: cleaned %d pages (phase 2)\n", page_count);
+
+    /*
+     * Phase 2.5: Unhook fork protection (copy_process / cgroup_post_fork).
+     * Must be done before BRK/step unhook — fork handler may reference
+     * shadow pages, but page_list is already empty so it will be a no-op.
+     */
+    if (kfunc_copy_process) {
+        hook_unwrap(kfunc_copy_process, NULL, after_copy_process_wx);
+        pr_info("wxshadow: unhooked copy_process (phase 2.5)\n");
+        wait_for_handlers_drain("phase2.5-copy_process");
+    }
+    if (kfunc_cgroup_post_fork) {
+        hook_unwrap(kfunc_cgroup_post_fork, NULL, after_cgroup_post_fork_wx);
+        pr_info("wxshadow: unhooked cgroup_post_fork (phase 2.5)\n");
+        wait_for_handlers_drain("phase2.5-cgroup_post_fork");
+    }
+
+    /*
+     * Phase 3: Unhook BRK and step handlers.
+     * page_list is now empty, so any handler that starts after Phase 2
+     * will find no matching page and return quickly.  However handlers
+     * that STARTED before Phase 2 completed (and are still executing
+     * module code) must finish before kp_free_exec() is called.
+     * wait_for_handlers_drain() handles this via the wx_in_flight counter.
+     */
     if (hook_method == WX_HOOK_METHOD_DIRECT) {
         hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
         hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
-        pr_info("wxshadow: unhooked brk_handler and single_step_handler (direct)\n");
+        pr_info("wxshadow: unhooked brk/step handlers (direct, phase 3)\n");
+
+        /* Wait for any in-flight direct-hook handler to complete */
+        wait_for_handlers_drain("phase3-direct");
+
     } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
         /*
-         * Manual unregister: the kernel's unregister_user_*_hook calls
-         * synchronize_rcu() which hangs in KPM exit context.
-         *
-         * We manually:
-         * 1. Hold debug_hook_lock (if available)
-         * 2. list_del_rcu both hooks
-         * 3. Release lock
-         * 4. Call synchronize_rcu (if available) to wait for readers
+         * Manual unregister via list_del_rcu under debug_hook_lock.
+         * Cannot call synchronize_rcu() — KP's unload_module() holds
+         * rcu_read_lock() while calling our exit, so synchronize_rcu()
+         * would deadlock.
          */
-        pr_info("wxshadow: unregistering hooks (manual)...\n");
-
-        if (kptr_debug_hook_lock) {
-            spin_lock(kptr_debug_hook_lock);
-        } else {
-            pr_warn("wxshadow: debug_hook_lock not found, unsafe unregister\n");
-        }
-
-        list_del_rcu(&wxshadow_step_hook.node);
-        list_del_rcu(&wxshadow_break_hook.node);
-
-        if (kptr_debug_hook_lock) {
-            spin_unlock(kptr_debug_hook_lock);
-        }
-
-        /* Re-init list_head to safe state */
-        INIT_LIST_HEAD(&wxshadow_step_hook.node);
-        INIT_LIST_HEAD(&wxshadow_break_hook.node);
-
-        /*
-         * NOTE: We intentionally skip synchronize_rcu() here.
-         * It hangs in KPM exit context (likely due to the calling context).
-         *
-         * This is acceptable because:
-         * 1. The hook functions are in KPM .text, valid until unload completes
-         * 2. Debug hook RCU readers (step/brk handlers) are very short-lived
-         * 3. We've already removed nodes from the list under debug_hook_lock
-         *
-         * Worst case: a concurrent handler sees stale data briefly, but
-         * the function pointers remain valid throughout this exit sequence.
-         */
-        pr_info("wxshadow: skipping synchronize_rcu (hangs in KPM exit context)\n");
-
-        pr_info("wxshadow: unregistered break/step hooks (register API)\n");
+        pr_info("wxshadow: unregistering hooks (manual, phase 3)...\n");
+        wx_unregister_brk_step_hooks();
+        wait_for_handlers_drain("phase3-register");
+        pr_info("wxshadow: unregistered break/step hooks (register API, phase 3)\n");
     }
     hook_method = WX_HOOK_METHOD_NONE;
 
-    /* Count pages first */
-    spin_lock(&global_lock);
-    list_for_each(pos, &page_list) {
-        page_count++;
+    /*
+     * Phase 4: Unhook do_page_fault.
+     * page_list is empty; fault handler will find no pages to process.
+     */
+    if (kfunc_do_page_fault) {
+        hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
+        pr_info("wxshadow: unhooked do_page_fault (phase 4)\n");
+        wait_for_handlers_drain("phase4-fault");
     }
 
-    if (page_count > 0) {
-        /* Allocate array to hold page pointers */
-        spin_unlock(&global_lock);
-        pages_to_free = kfunc_kzalloc(page_count * sizeof(struct wxshadow_page *),
-                                      detected_gfp_kernel);
-        spin_lock(&global_lock);
-
-        if (pages_to_free) {
-            /* Collect all pages and remove from list */
-            i = 0;
-            list_for_each_safe(pos, n, &page_list) {
-                page = container_of(pos, struct wxshadow_page, list);
-                list_del_init(&page->list);
-                if (i < page_count) {
-                    pages_to_free[i++] = page;
-                }
-            }
-            page_count = i;  /* Actual count collected */
-        } else {
-            /* Fallback: just remove from list without proper cleanup */
-            pr_warn("wxshadow: failed to allocate cleanup array, leaking memory\n");
-            list_for_each_safe(pos, n, &page_list) {
-                page = container_of(pos, struct wxshadow_page, list);
-                list_del_init(&page->list);
-            }
-            page_count = 0;
-        }
-    }
-    spin_unlock(&global_lock);
-
-    /* Cleanup pages outside the lock */
-    for (i = 0; i < page_count; i++) {
-        if (pages_to_free[i]) {
-            wxshadow_cleanup_page(pages_to_free[i]);
-        }
-    }
-
-    if (pages_to_free) {
-        kfunc_kfree(pages_to_free);
+    /*
+     * Phase 5: Unhook exit_mmap last.
+     * It was guarding Phase 2 against concurrent process exits.
+     * Safe to remove now that page_list is empty.
+     */
+    if (kfunc_exit_mmap) {
+        hook_unwrap(kfunc_exit_mmap, exit_mmap_before, NULL);
+        pr_info("wxshadow: unhooked exit_mmap (phase 5)\n");
+        wait_for_handlers_drain("phase5-exit_mmap");
     }
 
     pr_info("wxshadow: module unloaded (cleaned %d pages)\n", page_count);

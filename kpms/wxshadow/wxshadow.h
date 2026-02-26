@@ -21,6 +21,8 @@
 #define PR_WXSHADOW_DEL_BP      0x57580003  /* WX + 3 */
 #define PR_WXSHADOW_SET_TLB_MODE 0x57580004 /* WX + 4: Set TLB flush mode */
 #define PR_WXSHADOW_GET_TLB_MODE 0x57580005 /* WX + 5: Get TLB flush mode */
+#define PR_WXSHADOW_PATCH       0x57580006  /* WX + 6: Patch shadow page via kernel VA */
+#define PR_WXSHADOW_RELEASE     0x57580008  /* WX + 8: Release shadow */
 
 /* TLB flush modes */
 enum wxshadow_tlb_mode {
@@ -79,8 +81,23 @@ struct wxshadow_page {
     unsigned long pfn_original;     /* Original page PFN */
     unsigned long pfn_shadow;       /* Shadow page PFN */
     void *shadow_page;              /* Shadow page kernel VA (for free) */
+    void *orig_backup;              /* Backup copy of original page (kernel VA) */
+    unsigned long pfn_orig_backup;  /* PFN of orig_backup */
     enum wxshadow_state state;      /* Current state */
     void *stepping_task;            /* Task currently single-stepping */
+
+    /*
+     * Lifecycle fields (protected by global_lock):
+     *   refcount: 1 while in page_list (list's ref); each find_page/find_by_addr
+     *             caller increments before releasing the lock and must call
+     *             wxshadow_page_put() when done.  Struct is kfree'd when it
+     *             reaches 0.
+     *   dead:     set to true when the page is removed from page_list.
+     *             Handlers that obtained a ref before removal must check this
+     *             flag and skip any PTE-switch-to-shadow operations.
+     */
+    int  refcount;
+    bool dead;
 
     /* Breakpoint info */
     struct wxshadow_bp bps[WXSHADOW_MAX_BPS_PER_PAGE];
@@ -91,11 +108,7 @@ struct wxshadow_page {
 #define DBG_HOOK_HANDLED    0
 #define DBG_HOOK_ERROR      1
 
-/*
- * Hook method selection
- * WX_HOOK_METHOD_DIRECT: hook_wrap brk_handler/single_step_handler directly
- * WX_HOOK_METHOD_REGISTER: use register_user_break_hook/register_user_step_hook API
- */
+/* Hook method selection */
 enum wx_hook_method {
     WX_HOOK_METHOD_NONE = 0,
     WX_HOOK_METHOD_DIRECT,      /* Direct hook (preferred) */
@@ -122,14 +135,6 @@ struct wx_step_hook {
     int (*fn)(struct pt_regs *regs, unsigned int esr);
 };
 
-/* VM fault return values */
-#define VM_FAULT_NOPAGE     0x0001
-#define VM_FAULT_SIGBUS     0x0002
-#define VM_FAULT_RETRY      0x0400
-
-/* Page flags check */
-#define PG_anon             0
-
 /* PTE bits - use pgtable.h definitions if available */
 #ifndef PTE_VALID
 #define PTE_VALID           (1UL << 0)
@@ -152,16 +157,9 @@ struct wx_step_hook {
 #ifndef PTE_NG
 #define PTE_NG              (1UL << 11)
 #endif
-#ifndef PTE_PXN
-#define PTE_PXN             (1UL << 53)
-#endif
 #ifndef PTE_UXN
 #define PTE_UXN             (1UL << 54)
 #endif
-#ifndef PTE_WRITE
-#define PTE_WRITE           (1UL << 51)
-#endif
-
 /* Memory attribute index for normal memory */
 #ifndef PTE_ATTRINDX_NORMAL
 #define PTE_ATTRINDX_NORMAL (0UL << 2)

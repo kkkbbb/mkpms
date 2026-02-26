@@ -90,9 +90,20 @@ static inline void *wxshadow_pgd_offset(void *mm, unsigned long addr)
  */
 static inline void *wxshadow_pud_offset(void *p4d, unsigned long addr)
 {
-    u64 p4d_val = *(u64 *)p4d;
-    if (!p4d_val) return NULL;
-    unsigned long pud_base = pxd_page_vaddr(p4d_val);
+    u64 p4d_val;
+    unsigned long pud_base;
+
+    if (!p4d || !is_kva((unsigned long)p4d))
+        return NULL;
+    if (!safe_read_u64((unsigned long)p4d, &p4d_val))
+        return NULL;
+    if (!p4d_val)
+        return NULL;
+
+    pud_base = pxd_page_vaddr(p4d_val);
+    if (!is_kva(pud_base))
+        return NULL;
+
     return (void *)((u64 *)pud_base + pud_index(addr));
 }
 
@@ -101,15 +112,21 @@ static inline void *wxshadow_pud_offset(void *p4d, unsigned long addr)
  */
 static inline void *wxshadow_pmd_offset(void *pud, unsigned long addr)
 {
-    u64 pud_val = *(u64 *)pud;
-    if (!pud_val) return NULL;
-    unsigned long pa = pud_val & 0x0000FFFFFFFFF000UL;
-    pr_info("wxshadow: [pmd_offset] pud_val=%llx pa=%lx physvirt=%llx memstart=%llx\n",
-            pud_val, pa,
-            kvar_physvirt_offset ? *kvar_physvirt_offset : 0,
-            *kvar_memstart_addr);
-    unsigned long pmd_base = pxd_page_vaddr(pud_val);
-    pr_info("wxshadow: [pmd_offset] pmd_base=%lx pmd_index=%lx\n", pmd_base, pmd_index(addr));
+    u64 pud_val;
+    unsigned long pa, pmd_base;
+
+    if (!pud || !is_kva((unsigned long)pud))
+        return NULL;
+    if (!safe_read_u64((unsigned long)pud, &pud_val))
+        return NULL;
+    if (!pud_val)
+        return NULL;
+
+    pa = pud_val & 0x0000FFFFFFFFF000UL;
+
+    pmd_base = pxd_page_vaddr(pud_val);
+    if (!is_kva(pmd_base))
+        return NULL;
     return (void *)((u64 *)pmd_base + pmd_index(addr));
 }
 
@@ -127,8 +144,18 @@ static inline unsigned long pmd_page_vaddr(u64 pmd)
  */
 static inline u64 *pte_offset_kernel_local(void *pmd, unsigned long addr)
 {
-    u64 pmd_val = *(u64 *)pmd;
-    unsigned long pte_table_vaddr = pmd_page_vaddr(pmd_val);
+    u64 pmd_val;
+    unsigned long pte_table_vaddr;
+
+    if (!pmd || !is_kva((unsigned long)pmd))
+        return NULL;
+    if (!safe_read_u64((unsigned long)pmd, &pmd_val))
+        return NULL;
+
+    pte_table_vaddr = pmd_page_vaddr(pmd_val);
+    if (!is_kva(pte_table_vaddr))
+        return NULL;
+
     return (u64 *)(pte_table_vaddr + pte_index(addr) * sizeof(u64));
 }
 
@@ -147,20 +174,24 @@ u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp)
 {
     void *pgd, *pud, *pmd;
     u64 *pte;
-
-    pr_info("wxshadow: [get_user_pte] enter mm=%px addr=%lx page_level=%d\n",
-            mm, addr, wx_page_level);
+    u64 pgd_val, pud_val, pmd_val;
 
     pgd = wxshadow_pgd_offset(mm, addr);
-    pr_info("wxshadow: [get_user_pte] pgd=%px pgd_val=%llx\n", pgd, pgd ? *(u64 *)pgd : 0);
-    if (!pgd || (*(u64 *)pgd == 0))
+    if (!pgd || !is_kva((unsigned long)pgd))
+        return NULL;
+    if (!safe_read_u64((unsigned long)pgd, &pgd_val))
+        return NULL;
+    if (pgd_val == 0)
         return NULL;
 
     if (wx_page_level == 4) {
         /* 4-level page tables: PGD -> PUD -> PMD -> PTE */
         pud = wxshadow_pud_offset(pgd, addr);
-        pr_info("wxshadow: [get_user_pte] pud=%px pud_val=%llx\n", pud, pud ? *(u64 *)pud : 0);
-        if (!pud || (*(u64 *)pud == 0))
+        if (!pud)
+            return NULL;
+        if (!safe_read_u64((unsigned long)pud, &pud_val))
+            return NULL;
+        if (pud_val == 0)
             return NULL;
 
         pmd = wxshadow_pmd_offset(pud, addr);
@@ -168,12 +199,14 @@ u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp)
         /* 3-level page tables: PGD -> PMD -> PTE (no PUD) */
         pmd = wxshadow_pmd_offset(pgd, addr);
     }
-    pr_info("wxshadow: [get_user_pte] pmd=%px pmd_val=%llx\n", pmd, pmd ? *(u64 *)pmd : 0);
-    if (!pmd || (*(u64 *)pmd == 0))
+    if (!pmd)
+        return NULL;
+    if (!safe_read_u64((unsigned long)pmd, &pmd_val))
+        return NULL;
+    if (pmd_val == 0)
         return NULL;
 
     /* Check if PMD is a section/block mapping (2MB huge page) */
-    u64 pmd_val = *(u64 *)pmd;
     if (pmd_sect(pmd_val)) {
         pr_warn("wxshadow: address 0x%lx is in 2MB section mapping, not supported\n", addr);
         return NULL;
@@ -185,13 +218,13 @@ u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp)
 
     /* Get PTE pointer */
     pte = pte_offset_kernel_local(pmd, addr);
-    pr_info("wxshadow: [get_user_pte] pte=%px pte_val=%llx\n", pte, pte ? *pte : 0);
+    if (!pte || !is_kva((unsigned long)pte))
+        return NULL;
 
     /* ptlp is ignored - we operate locklessly */
     if (ptlp)
         *ptlp = NULL;
 
-    pr_info("wxshadow: [get_user_pte] returning pte=%px (lockless)\n", pte);
     return pte;
 }
 
@@ -298,9 +331,6 @@ static void wxshadow_tlbi_page(void *mm, unsigned long uaddr)
     /* Ensure TLB invalidation completes before continuing */
     asm volatile("dsb ish" : : : "memory");
     asm volatile("isb" : : : "memory");
-
-    pr_info("wxshadow: TLBI %s: addr=%lx asid=%llu tlbi_val=%llx\n",
-            mode_str, uaddr, asid, tlbi_val);
 }
 
 /*
@@ -342,23 +372,20 @@ int wxshadow_switch_mapping(void *vma, unsigned long addr,
     void *mm = vma_mm(vma);
     u64 *pte;
     u64 entry;
-    u64 old_val, new_val;
+
+    if (!mm) {
+        pr_err("wxshadow: [switch] vma_mm returned NULL\n");
+        return -1;
+    }
 
     pte = get_user_pte(mm, addr, NULL);
     if (!pte) {
-        pr_err("wxshadow: [switch] FAILED get_user_pte addr=%lx\n", addr);
+        pr_err("wxshadow: [switch] get_user_pte failed for addr=%lx\n", addr);
         return -1;
     }
-    old_val = *pte;
 
     entry = make_pte(target_pfn, prot);
     wxshadow_set_pte_at(mm, addr, pte, entry);
-
-    /* Read back and verify */
-    new_val = *pte;
-    pr_info("wxshadow: [switch] addr=%lx pfn=%lx old=%llx new=%llx expect=%llx\n",
-            addr, target_pfn, old_val, new_val, entry);
-
     wxshadow_flush_tlb_page(vma, addr);
 
     return 0;

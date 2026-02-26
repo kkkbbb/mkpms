@@ -23,7 +23,10 @@
 #include <syscall.h>
 #include <kputils.h>
 #include <asm/ptrace.h>
+#include <asm/atomic.h>
+#include <linux/err.h>
 
+#include <predata.h>
 #include "wxshadow.h"
 
 /* ========== ARM64 CPU helpers ========== */
@@ -54,16 +57,12 @@ static inline struct task_struct *wx_next_task(struct task_struct *task)
     return (struct task_struct *)((char *)next - task_struct_offset.tasks_offset);
 }
 
-#define wx_for_each_process(p) \
-    for (p = wx_init_task; (p = wx_next_task(p)) != wx_init_task; )
-
 /* ========== Kernel function pointers ========== */
 
 /* Memory management */
 extern void *(*kfunc_find_vma)(void *mm, unsigned long addr);
 extern void *(*kfunc_get_task_mm)(void *task);
 extern void (*kfunc_mmput)(void *mm);
-extern void (*kfunc_mmget)(void *mm);
 /* find_task_by_vpid: use find_task_by_vpid() from linux/sched.h */
 
 /* exit_mmap hook */
@@ -72,8 +71,6 @@ extern void *kfunc_exit_mmap;
 /* Page allocation */
 extern unsigned long (*kfunc___get_free_pages)(unsigned int gfp_mask, unsigned int order);
 extern void (*kfunc_free_pages)(unsigned long addr, unsigned int order);
-extern void (*kfunc_get_page)(void *page);
-extern void (*kfunc_put_page)(void *page);
 
 /* Address translation */
 extern s64 *kvar_memstart_addr;
@@ -81,9 +78,6 @@ extern s64 *kvar_physvirt_offset;
 extern unsigned long page_offset_base;
 extern s64 detected_physvirt_offset;
 extern int physvirt_offset_valid;
-
-/* GFP_KERNEL value */
-extern unsigned int detected_gfp_kernel;
 
 /* Page table config */
 extern int wx_page_shift;
@@ -101,10 +95,6 @@ extern int wx_page_level;
  */
 #define wxfunc(func) wx_##func
 #define wxfunc_def(func) (*wx_##func)
-/* NOTE: wxfunc_lookup_name is deprecated - use lookup_name_safe() directly in wxshadow_scan.c
- * kallsyms_lookup_name() can hang when traversing module symbols on some kernels */
-#define wxfunc_lookup_name(func) wx_##func = (typeof(wx_##func))kallsyms_lookup_name(#func)
-
 /* Spinlock functions */
 extern void wxfunc_def(_raw_spin_lock)(raw_spinlock_t *lock);
 extern void wxfunc_def(_raw_spin_unlock)(raw_spinlock_t *lock);
@@ -130,7 +120,6 @@ extern pid_t wxfunc_def(__task_pid_nr_ns)(struct task_struct *task, enum pid_typ
 extern struct task_struct *wx_init_task;
 
 /* Cache operations */
-extern void (*kfunc___sync_icache_dcache)(u64 pte);
 extern void (*kfunc_flush_dcache_page)(void *page);
 extern void (*kfunc___flush_icache_range)(unsigned long start, unsigned long end);
 
@@ -144,9 +133,7 @@ extern void *kfunc_single_step_handler;
 
 /* register_user_*_hook API (fallback) */
 extern void (*kfunc_register_user_break_hook)(struct wx_break_hook *hook);
-extern void (*kfunc_unregister_user_break_hook)(struct wx_break_hook *hook);
 extern void (*kfunc_register_user_step_hook)(struct wx_step_hook *hook);
-extern void (*kfunc_unregister_user_step_hook)(struct wx_step_hook *hook);
 extern spinlock_t *kptr_debug_hook_lock;
 
 /* Locking - NOT USED (lockless operation) */
@@ -164,14 +151,15 @@ extern void (*kfunc_kfree)(void *ptr);
 /* Safe memory access */
 extern long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 
-/* rmap operations (optional) */
-extern void (*kfunc_page_remove_rmap)(void *page, bool compound);
-extern void (*kfunc_page_add_anon_rmap)(void *page, void *vma, unsigned long addr, bool compound);
-extern void (*kfunc_page_add_new_anon_rmap)(void *page, void *vma, unsigned long addr, bool compound);
-extern void (*kfunc_page_add_file_rmap)(void *page, bool compound);
+/* User memory access */
+extern unsigned long (*kfunc_copy_from_user)(void *to, const void __user *from, unsigned long n);
 
 /* do_page_fault hook */
 extern void *kfunc_do_page_fault;
+
+/* copy_process hook (fork protection) */
+extern void *kfunc_copy_process;
+extern void *kfunc_cgroup_post_fork;
 
 /* TLB flush */
 extern void (*kfunc_flush_tlb_page)(void *vma, unsigned long uaddr);
@@ -182,7 +170,6 @@ extern void (*kfunc___flush_tlb_range)(void *vma, unsigned long start, unsigned 
 
 extern int16_t vma_vm_mm_offset;
 /* mm_pgd_offset: use mm_struct_offset.pgd_offset from KP framework (linux/mm_types.h) */
-extern int16_t mm_mmap_offset;
 /* NOTE: mm_page_table_lock_offset and mm_mmap_lock_offset_dyn are NOT used (lockless) */
 
 /* mm->context.id offset for ASID (detected at runtime) */
@@ -196,6 +183,18 @@ extern int tlb_flush_mode;
 /* Use KP framework's spinlock_t and list_head from linux/spinlock.h and linux/list.h */
 extern struct list_head page_list;      /* Global list of wxshadow_page */
 extern spinlock_t global_lock;
+
+/*
+ * In-flight handler counter.
+ * Incremented by each handler on entry, decremented on exit.
+ * wxshadow_exit() waits for this to reach 0 after unhooking handlers
+ * before returning — ensuring no module code is executing when KP calls
+ * kp_free_exec(mod->start) immediately after exit() returns.
+ */
+extern atomic_t wx_in_flight;
+
+#define WX_HANDLER_ENTER() atomic_inc(&wx_in_flight)
+#define WX_HANDLER_EXIT()  atomic_dec(&wx_in_flight)
 
 /* init_task: use init_task from linux/init_task.h (KernelPatch framework) */
 
@@ -244,6 +243,49 @@ static inline bool is_permission_fault(unsigned int esr)
  * - list_for_each() / list_for_each_safe()
  * - container_of() from linux/container_of.h
  */
+
+/* ========== Kernel address validation ========== */
+
+/*
+ * is_kva - check if address is a valid kernel virtual address
+ * ARM64 TTBR1 addresses have high 16 bits set to 0xffff
+ */
+static inline bool is_kva(unsigned long addr)
+{
+    return (addr >> 48) == 0xffff;
+}
+
+/* ========== Safe memory read helpers ========== */
+
+/*
+ * safe_read_u64 - safely read a u64 from kernel memory
+ * Returns true on success, false if address is invalid or unreadable
+ * Note: kfunc_copy_from_kernel_nofault is declared later in this file
+ */
+static inline bool safe_read_u64(unsigned long addr, u64 *out)
+{
+    extern long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
+
+    if (!is_kva(addr))
+        return false;
+
+    if (kfunc_copy_from_kernel_nofault) {
+        if (kfunc_copy_from_kernel_nofault(out, (const void *)addr, sizeof(*out)) != 0)
+            return false;
+    } else {
+        /* Fallback: direct access (less safe) */
+        *out = *(u64 *)addr;
+    }
+    return true;
+}
+
+/*
+ * safe_read_ptr - safely read a pointer from kernel memory
+ */
+static inline bool safe_read_ptr(unsigned long addr, void **out)
+{
+    return safe_read_u64(addr, (u64 *)out);
+}
 
 /* ========== VMA field helpers ========== */
 
@@ -339,6 +381,36 @@ static inline void *pfn_to_kaddr(unsigned long pfn)
 
 /* ========== Cache operations ========== */
 
+/*
+ * wxshadow_flush_kern_dcache_area - clean dcache to PoU for a kernel VA range.
+ *
+ * After writing to a shadow page via kernel VA (memcpy / copy_from_user),
+ * the dirty dcache lines must be cleaned to the Point of Unification so that
+ * subsequent instruction fetches (via user VA) see the updated data.
+ *
+ * Using kernel VA for dc cvau is critical because:
+ *  - The kernel VA is always mapped (TTBR1), so dc cvau never silently fails.
+ *  - In cross-process patching (pid != 0), the target's user VA is NOT mapped
+ *    in the calling process's TTBR0, so dc cvau at user VA would be a NOP.
+ *  - dcache is PIPT, so cleaning by kernel VA cleans the same physical line
+ *    that instruction fetch via user VA will access.
+ */
+static inline void wxshadow_flush_kern_dcache_area(unsigned long kva, unsigned long size)
+{
+    unsigned long addr, end;
+    u64 ctr_el0, line_size;
+
+    /* Read cache line size from CTR_EL0.DminLine */
+    asm volatile("mrs %0, ctr_el0" : "=r"(ctr_el0));
+    line_size = 4 << ((ctr_el0 >> 16) & 0xf);
+
+    end = kva + size;
+    for (addr = kva & ~(line_size - 1); addr < end; addr += line_size)
+        asm volatile("dc cvau, %0" : : "r"(addr) : "memory");
+
+    asm volatile("dsb ish" : : : "memory");
+}
+
 static inline void wxshadow_flush_icache_range(unsigned long start, unsigned long end)
 {
     if (kfunc___flush_icache_range) {
@@ -346,6 +418,7 @@ static inline void wxshadow_flush_icache_range(unsigned long start, unsigned lon
         asm volatile("isb" : : : "memory");
         return;
     }
+    /* Fallback: global icache invalidate (dcache must already be clean) */
     asm volatile("ic ialluis" : : : "memory");
     asm volatile("dsb ish" : : : "memory");
     asm volatile("isb" : : : "memory");
@@ -362,6 +435,13 @@ static inline void wxshadow_flush_icache_page(unsigned long addr)
 /* NOTE: mm_get_asid removed - using kernel flush_tlb_page directly */
 
 /* ========== Core functions (wxshadow.c) ========== */
+
+/*
+ * wxshadow_page_put - release one reference to a page.
+ * When refcount drops to zero the struct is kfree'd.
+ * Safe to call from any context; acquires global_lock internally.
+ */
+void wxshadow_page_put(struct wxshadow_page *page);
 
 struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr);
 struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr);
@@ -380,6 +460,11 @@ void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr);
 u64 make_pte(unsigned long pfn, u64 prot);
 int wxshadow_switch_mapping(void *vma, unsigned long addr, unsigned long target_pfn, u64 prot);
 
+/* ========== Fork handler (wxshadow_handlers.c) ========== */
+
+void after_copy_process_wx(hook_fargs8_t *args, void *udata);
+void after_cgroup_post_fork_wx(hook_fargs4_t *args, void *udata);
+
 /* ========== Fault handler functions (wxshadow_handlers.c) ========== */
 
 int wxshadow_handle_read_fault(void *mm, unsigned long addr);
@@ -396,6 +481,10 @@ void single_step_handler_before(hook_fargs3_t *args, void *udata);
 int wxshadow_do_set_bp(void *mm, unsigned long addr);
 int wxshadow_do_set_reg(void *mm, unsigned long addr, unsigned int reg_idx, unsigned long value);
 int wxshadow_do_del_bp(void *mm, unsigned long addr);
+int wxshadow_do_del_all_bp(void *mm);
+int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned long len);
+int wxshadow_do_release(void *mm, unsigned long addr);
+int wxshadow_do_release_all(void *mm);
 void prctl_before(hook_fargs4_t *args, void *udata);
 
 /* ========== Scan functions (wxshadow_scan.c) ========== */
