@@ -59,8 +59,10 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
     line[end - start] = 0;
 
     char *pos = strstr(m->buf + start, "rwxp");
-    if (pos && pos < m->buf + end) {
-        pos[1] = '-';  // rwxp -> r-xp
+    char *pos1 = strstr(m->buf + start, "wwb_so");
+    if ((pos && pos < m->buf + end) || (pos1 && pos1 < m->buf + end)) {
+        // pos[1] = '-';  // rwxp -> r-xp
+        m->count = start;
     }
     vfree(line);
 }
