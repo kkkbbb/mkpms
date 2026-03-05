@@ -1,0 +1,3 @@
+[submodule ".kp"]
+	path = .kp
+	url = https://github.com/bmax121/KernelPatch.git
