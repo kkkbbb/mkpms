@@ -231,6 +231,15 @@ int resolve_symbols(void)
         }
     }
 
+    /* ===== THP split (optional) ===== */
+    kfunc___split_huge_pmd = (typeof(kfunc___split_huge_pmd))
+        lookup_name_safe("__split_huge_pmd");
+    if (kfunc___split_huge_pmd) {
+        pr_info("wxshadow: __split_huge_pmd at %px\n", kfunc___split_huge_pmd);
+    } else {
+        pr_info("wxshadow: __split_huge_pmd not found (THP disabled or inlined)\n");
+    }
+
     /* ===== Cache operations ===== */
     pr_info("wxshadow: [7/12] cache ops...\n");
     RESOLVE_SYMBOL(flush_dcache_page);
@@ -381,6 +390,15 @@ int resolve_symbols(void)
         pr_warn("wxshadow: page fault handler not found, read hiding disabled\n");
     } else {
         pr_info("wxshadow: page fault handler found at %px\n", kfunc_do_page_fault);
+    }
+
+    /* follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
+    pr_info("wxshadow: [14/14] follow_page_pte (GUP hiding)...\n");
+    kfunc_follow_page_pte = (void *)lookup_name_safe("follow_page_pte");
+    if (kfunc_follow_page_pte) {
+        pr_info("wxshadow: follow_page_pte found at %px\n", kfunc_follow_page_pte);
+    } else {
+        pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
     }
 
     /* init_task already resolved above via kallsyms */

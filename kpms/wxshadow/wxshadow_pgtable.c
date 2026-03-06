@@ -159,6 +159,82 @@ static inline u64 *pte_offset_kernel_local(void *pmd, unsigned long addr)
     return (u64 *)(pte_table_vaddr + pte_index(addr) * sizeof(u64));
 }
 
+/* ========== PMD split (huge page → PTE table) ========== */
+
+/*
+ * wxshadow_try_split_pmd - split PMD block mapping via kernel's __split_huge_pmd.
+ *
+ * Call from process context before get_user_pte() when the target address
+ * may be in a THP (2MB block) mapping.  If the PMD is already a table
+ * entry (normal pages), this is a no-op.
+ *
+ * @mm:   mm_struct pointer
+ * @vma:  vm_area_struct covering addr (from find_vma)
+ * @addr: target virtual address
+ *
+ * Returns 0 on success (or no split needed), negative errno on failure.
+ */
+int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr)
+{
+    void *pgd, *pud, *pmd;
+    u64 pgd_val, pud_val, pmd_val;
+
+    if (!mm || !vma)
+        return 0;
+
+    /* Walk page tables to PMD level */
+    pgd = wxshadow_pgd_offset(mm, addr);
+    if (!pgd || !is_kva((unsigned long)pgd))
+        return 0;
+    if (!safe_read_u64((unsigned long)pgd, &pgd_val) || pgd_val == 0)
+        return 0;
+
+    if (wx_page_level == 4) {
+        pud = wxshadow_pud_offset(pgd, addr);
+        if (!pud)
+            return 0;
+        if (!safe_read_u64((unsigned long)pud, &pud_val) || pud_val == 0)
+            return 0;
+        pmd = wxshadow_pmd_offset(pud, addr);
+    } else {
+        pmd = wxshadow_pmd_offset(pgd, addr);
+    }
+    if (!pmd)
+        return 0;
+    if (!safe_read_u64((unsigned long)pmd, &pmd_val) || pmd_val == 0)
+        return 0;
+
+    /* Not a block mapping — nothing to do */
+    if (!pmd_sect(pmd_val))
+        return 0;
+
+    if (!kfunc___split_huge_pmd) {
+        pr_err("wxshadow: addr %lx is in PMD block but __split_huge_pmd not available\n", addr);
+        return -38;  /* ENOSYS */
+    }
+
+    {
+        int pxd_bits = wx_page_shift - 3;
+        unsigned long pmd_shift_val = wx_page_shift + 1 * pxd_bits;
+        unsigned long block_mask = ~((1UL << pmd_shift_val) - 1);
+
+        pr_info("wxshadow: splitting PMD block at %lx via __split_huge_pmd\n",
+                addr & block_mask);
+        kfunc___split_huge_pmd(vma, pmd, addr & block_mask, false, NULL);
+    }
+
+    /* Verify split succeeded */
+    if (!safe_read_u64((unsigned long)pmd, &pmd_val))
+        return -14;
+    if (pmd_sect(pmd_val)) {
+        pr_err("wxshadow: PMD still block after __split_huge_pmd for addr %lx\n", addr);
+        return -1;
+    }
+
+    pr_info("wxshadow: PMD split succeeded for addr %lx\n", addr);
+    return 0;
+}
+
 /* ========== PTE operations ========== */
 
 /*
@@ -206,9 +282,9 @@ u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp)
     if (pmd_val == 0)
         return NULL;
 
-    /* Check if PMD is a section/block mapping (2MB huge page) */
+    /* Block mapping: caller should have called wxshadow_try_split_pmd() first */
     if (pmd_sect(pmd_val)) {
-        pr_warn("wxshadow: address 0x%lx is in 2MB section mapping, not supported\n", addr);
+        pr_warn("wxshadow: addr 0x%lx is PMD block, call wxshadow_try_split_pmd() first\n", addr);
         return NULL;
     }
     if (!pmd_table(pmd_val)) {
