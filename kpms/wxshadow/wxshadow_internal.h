@@ -154,6 +154,9 @@ extern long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t
 /* do_page_fault hook */
 extern void *kfunc_do_page_fault;
 
+/* follow_page_pte hook (GUP hiding) */
+extern void *kfunc_follow_page_pte;
+
 /* copy_process hook (fork protection) */
 extern void *kfunc_copy_process;
 extern void *kfunc_cgroup_post_fork;
@@ -162,6 +165,10 @@ extern void *kfunc_cgroup_post_fork;
 extern void (*kfunc_flush_tlb_page)(void *vma, unsigned long uaddr);
 extern void (*kfunc___flush_tlb_range)(void *vma, unsigned long start, unsigned long end,
                                         unsigned long stride, bool last_level, int tlb_level);
+
+/* THP split */
+extern void (*kfunc___split_huge_pmd)(void *vma, void *pmd, unsigned long address,
+                                       bool freeze, void *page);
 
 /* ========== mm_struct offsets ========== */
 
@@ -445,12 +452,13 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr);
 void wxshadow_free_page(struct wxshadow_page *page);
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long addr);
 int wxshadow_validate_page_mapping(void *mm, void *vma, struct wxshadow_page *page_info, unsigned long page_addr);
-int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason);
+void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason);
 int wxshadow_handle_write_fault(void *mm, unsigned long addr);
 
 /* ========== Page table functions (wxshadow_pgtable.c) ========== */
 
 u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp);
+int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr);
 void pte_unmap_unlock(u64 *pte, void *ptl);
 void wxshadow_set_pte_at(void *mm, unsigned long addr, u64 *ptep, u64 pte);
 void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr);
@@ -467,6 +475,8 @@ void after_cgroup_post_fork_wx(hook_fargs4_t *args, void *udata);
 int wxshadow_handle_read_fault(void *mm, unsigned long addr);
 int wxshadow_handle_exec_fault(void *mm, unsigned long addr);
 void do_page_fault_before(hook_fargs3_t *args, void *udata);
+void follow_page_pte_before(hook_fargs5_t *args, void *udata);
+void follow_page_pte_after(hook_fargs5_t *args, void *udata);
 void exit_mmap_before(hook_fargs1_t *args, void *udata);
 int wxshadow_brk_handler(struct pt_regs *regs, unsigned int esr);
 int wxshadow_step_handler(struct pt_regs *regs, unsigned int esr);

@@ -70,6 +70,13 @@ int wxshadow_do_set_bp(void *mm, unsigned long addr)
         return -1;
     }
 
+    /* Split PMD block if needed (THP) */
+    ret = wxshadow_try_split_pmd(mm, vma, page_addr);
+    if (ret < 0) {
+        pr_err("wxshadow: [set_bp] PMD split failed for %lx: %d\n", page_addr, ret);
+        return ret;
+    }
+
     /* Check if page already has shadow */
     page_info = wxshadow_find_page(mm, page_addr);  /* caller ref if non-NULL */
     if (page_info && page_info->shadow_page) {
@@ -277,6 +284,13 @@ static void *copy_from_user_via_pte(void __user *ubuf, unsigned long len)
     if (!caller_mm)
         return NULL;
 
+    /* Split PMD block if user buffer is in THP */
+    {
+        void *buf_vma = kfunc_find_vma(caller_mm, uaddr);
+        if (buf_vma && vma_start(buf_vma) <= uaddr)
+            wxshadow_try_split_pmd(caller_mm, buf_vma, buf_page);
+    }
+
     buf_pte = get_user_pte(caller_mm, buf_page, NULL);
     if (!buf_pte || !(*buf_pte & PTE_VALID)) {
         pr_err("wxshadow: no PTE for user buffer %lx\n", uaddr);
@@ -332,6 +346,13 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
     if (!vma || vma_start(vma) > addr) {
         pr_err("wxshadow: [patch] no vma for %lx\n", addr);
         ret = -1;
+        goto out_free;
+    }
+
+    /* Split PMD block if needed (THP) */
+    ret = wxshadow_try_split_pmd(mm, vma, page_addr);
+    if (ret < 0) {
+        pr_err("wxshadow: [patch] PMD split failed for %lx: %d\n", page_addr, ret);
         goto out_free;
     }
 
@@ -431,35 +452,18 @@ out_free:
 int wxshadow_do_release(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page_info;
-    void *vma;
     unsigned long page_addr = addr & PAGE_MASK;
-    u64 prot;
 
     pr_info("wxshadow: [release] addr=%lx\n", addr);
 
-    /* Find page */
     page_info = wxshadow_find_page(mm, page_addr);
     if (!page_info) {
         pr_err("wxshadow: [release] page not found for %lx\n", addr);
         return -2;  /* ENOENT */
     }
 
-    /* Find VMA */
-    vma = kfunc_find_vma(mm, addr);
-    if (vma && vma_start(vma) <= addr) {
-        /* Switch back to original page with r-x permission */
-        if (page_info->pfn_original) {
-            prot = PTE_USER | PTE_RDONLY;  /* r-x */
-            wxshadow_switch_mapping(vma, page_addr, page_info->pfn_original, prot);
-            pr_info("wxshadow: [release] restored original mapping for %lx\n", page_addr);
-        }
-    }
-
-    /* auto_cleanup: marks dead, captures shadow, removes from list, puts list ref. */
-    wxshadow_auto_cleanup_page(page_info, "user release");
-    wxshadow_page_put(page_info);  /* release caller ref → kfree */
-    pr_info("wxshadow: [release] cleaned up page structure for %lx\n", page_addr);
-
+    wxshadow_teardown_page(page_info, "user release");
+    wxshadow_page_put(page_info);
     return 0;
 }
 
@@ -523,87 +527,34 @@ int wxshadow_do_del_bp(void *mm, unsigned long addr)
         return 0;
     }
 
-    /* Last BP - restore PTE then remove page from list and free. */
-    vma = kfunc_find_vma(mm, addr);
-    if (vma && vma_start(vma) <= addr) {
-        if (page_info->state != WX_STATE_NONE && page_info->shadow_page) {
-            /* Switch back to original */
-            prot = PTE_USER | PTE_RDONLY;
-            wxshadow_switch_mapping(vma, page_addr, page_info->pfn_original, prot);
-            pr_info("wxshadow: restored original mapping for %lx\n", page_addr);
-        }
-    }
-
-    /* auto_cleanup: marks dead, captures shadow, removes from list, puts list ref. */
-    wxshadow_auto_cleanup_page(page_info, "last bp removed");
-    wxshadow_page_put(page_info);  /* release caller ref → kfree */
-    pr_info("wxshadow: cleaned up page structure for %lx\n", page_addr);
-
+    /* Last BP - unified teardown handles PTE restore, free, etc. */
+    wxshadow_teardown_page(page_info, "last bp removed");
+    wxshadow_page_put(page_info);
     return 0;
 }
 
 /* ========== Delete all breakpoints for mm ========== */
 
 /*
- * Helper: restore and free a single page (must be called WITHOUT global_lock)
- */
-static void release_one_page(void *mm, struct wxshadow_page *page)
-{
-    void *vma;
-    u64 prot;
-
-    /* Disable single step if task is stepping */
-    if (page->stepping_task && kfunc_user_disable_single_step) {
-        kfunc_user_disable_single_step(page->stepping_task);
-        page->stepping_task = NULL;
-    }
-
-    /* Restore original page mapping */
-    if (page->pfn_original && page->state != WX_STATE_NONE) {
-        vma = kfunc_find_vma(mm, page->page_addr);
-        if (vma && vma_start(vma) <= page->page_addr) {
-            prot = PTE_USER | PTE_RDONLY;  /* r-x */
-            wxshadow_switch_mapping(vma, page->page_addr,
-                                    page->pfn_original, prot);
-            wxshadow_flush_icache_page(page->page_addr);
-        }
-    }
-
-    /* Shadow page memory and page struct freed by caller (collect_and_release_pages). */
-}
-
-/*
- * collect_and_release_pages - iteratively pop and release all pages for mm.
+ * collect_and_release_pages - iteratively find and teardown all pages for mm.
  *
- * Uses a simple "find first match, pop under lock, release outside lock" loop.
- * No intermediate allocation needed; eliminates TOCTOU races.
+ * Uses wxshadow_teardown_page for each page, which handles all cleanup
+ * (mark dead, disable single-step, restore PTE, free shadow/backup).
  */
 static int collect_and_release_pages(void *mm)
 {
-    struct list_head *pos, *n;
+    struct list_head *pos;
     struct wxshadow_page *page;
-    unsigned long shadow_vaddr;
-    unsigned long backup_vaddr;
     int count = 0;
 
     while (1) {
-        /* Pop the first page belonging to mm under the lock.
-         * Capture shadow_vaddr/backup_vaddr and clear pointers under the lock so
-         * concurrent handlers cannot double-free them. */
         page = NULL;
-        shadow_vaddr = 0;
-        backup_vaddr = 0;
         spin_lock(&global_lock);
-        list_for_each_safe(pos, n, &page_list) {
+        list_for_each(pos, &page_list) {
             struct wxshadow_page *p =
                 container_of(pos, struct wxshadow_page, list);
             if (p->mm == mm) {
-                shadow_vaddr = (unsigned long)p->shadow_page;
-                p->shadow_page = NULL;
-                backup_vaddr = (unsigned long)p->orig_backup;
-                p->orig_backup = NULL;
-                p->dead = true;
-                list_del_init(&p->list);
+                p->refcount++;  /* caller ref */
                 page = p;
                 break;
             }
@@ -613,16 +564,8 @@ static int collect_and_release_pages(void *mm)
         if (!page)
             break;
 
-        /* Free shadow page and orig_backup outside the lock (may sleep/schedule). */
-        if (shadow_vaddr)
-            kfunc_free_pages(shadow_vaddr, 0);
-        if (backup_vaddr)
-            kfunc_free_pages(backup_vaddr, 0);
-
-        pr_info("wxshadow: [release_all] releasing page addr=%lx state=%d\n",
-                page->page_addr, page->state);
-        release_one_page(mm, page);
-        wxshadow_page_put(page);  /* release list ref → kfree when refcount hits 0 */
+        wxshadow_teardown_page(page, "release_all");
+        wxshadow_page_put(page);
         count++;
     }
 

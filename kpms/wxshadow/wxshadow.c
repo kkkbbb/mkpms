@@ -101,6 +101,9 @@ long (*kfunc_copy_from_kernel_nofault)(void *dst, const void *src, size_t size);
 /* do_page_fault hook */
 void *kfunc_do_page_fault = NULL;
 
+/* follow_page_pte hook (GUP hiding for /proc/pid/mem etc.) */
+void *kfunc_follow_page_pte = NULL;
+
 /* copy_process hook (fork protection) */
 void *kfunc_copy_process = NULL;
 void *kfunc_cgroup_post_fork = NULL;
@@ -109,6 +112,10 @@ void *kfunc_cgroup_post_fork = NULL;
 void (*kfunc_flush_tlb_page)(void *vma, unsigned long uaddr);
 void (*kfunc___flush_tlb_range)(void *vma, unsigned long start, unsigned long end,
                                  unsigned long stride, bool last_level, int tlb_level);
+
+/* THP split */
+void (*kfunc___split_huge_pmd)(void *vma, void *pmd, unsigned long address,
+                                bool freeze, void *page);
 
 /* ========== mm_struct offsets ========== */
 
@@ -329,59 +336,44 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
 }
 
 /*
- * wxshadow_auto_cleanup_page - emergency cleanup called from handlers.
+ * wxshadow_teardown_page - unified page cleanup.
  *
- * The caller MUST already hold a reference (obtained via find_page or
- * find_by_addr).  This function:
- *   1. Marks the page dead and captures the shadow_page pointer under
- *      global_lock — preventing a concurrent exit-loop or exit_mmap path
- *      from double-freeing the shadow.
- *   2. Removes the page from page_list and releases the LIST's reference
- *      via wxshadow_page_put().
- *   3. The CALLER must call wxshadow_page_put() afterwards to release its
- *      own reference.
+ * Performs a complete, safe teardown of a shadow page:
+ *   1. Under global_lock: mark dead, capture and NULL shadow_page/orig_backup/
+ *      stepping_task, remove from page_list (if still present).
+ *   2. Disable single-step on the stepping task (with pointer validation).
+ *   3. Brief spin for any concurrent step-handler that already passed the
+ *      dead check (covers the STEPPING race window).
+ *   4. Restore PTE to original page (if mm and VMA are still valid).
+ *   5. Flush icache.
+ *   6. Free shadow and backup page memory.
+ *   7. Release the list's reference via wxshadow_page_put().
  *
- * NOTE: This function does NOT restore the PTE.  The caller is responsible
- * for any PTE restoration before calling here (or accepting that the mapping
- * will be cleaned up by the OS as part of the faulting path).
+ * Caller MUST hold a ref (from find_page / find_by_addr) and must call
+ * wxshadow_page_put() after this function returns.
+ *
+ * Safe to call even if the page has already been removed from page_list
+ * (list_del_init is idempotent on an initialized-but-empty node).
  */
-int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
+void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
 {
     unsigned long shadow_vaddr = 0;
     unsigned long backup_vaddr = 0;
-    int i;
+    void *stepping = NULL;
+    int state;
+    bool was_in_list;
 
     if (!page)
-        return -1;
+        return;
 
-    pr_info("wxshadow: ===============================================\n");
-    pr_info("wxshadow: === AUTO CLEANUP: %s ===\n", reason);
-    pr_info("wxshadow: ===============================================\n");
-    pr_info("wxshadow:   Page addr:  0x%lx\n", page->page_addr);
-    pr_info("wxshadow:   State:      %d\n", page->state);
-    pr_info("wxshadow:   PFN orig:   0x%lx\n", page->pfn_original);
-    pr_info("wxshadow:   PFN shadow: 0x%lx\n", page->pfn_shadow);
-
+    /* --- Step 1: mark dead, capture resources, remove from list --- */
     spin_lock(&global_lock);
-
-    /* Mark dead so concurrent step-handlers skip the shadow PTE switch. */
     page->dead = true;
+    state = page->state;
 
-    for (i = 0; i < page->nr_bps; i++) {
-        if (page->bps[i].active) {
-            pr_info("wxshadow:   Removing BP at 0x%lx\n", page->bps[i].addr);
-            page->bps[i].active = false;
-            memset(&page->bps[i].reg_mods, 0, sizeof(page->bps[i].reg_mods));
-            page->bps[i].nr_reg_mods = 0;
-        }
-    }
+    stepping = page->stepping_task;
+    page->stepping_task = NULL;
 
-    if (page->stepping_task) {
-        pr_info("wxshadow:   Clearing stepping task %px\n", page->stepping_task);
-        page->stepping_task = NULL;
-    }
-
-    /* Capture and NULL shadow_page/orig_backup under lock to prevent double-free. */
     if (page->shadow_page) {
         shadow_vaddr = (unsigned long)page->shadow_page;
         page->shadow_page = NULL;
@@ -391,25 +383,59 @@ int wxshadow_auto_cleanup_page(struct wxshadow_page *page, const char *reason)
         page->orig_backup = NULL;
     }
 
-    /* Remove from list while holding lock. */
-    list_del_init(&page->list);
+    was_in_list = !list_empty(&page->list);
+    if (was_in_list)
+        list_del_init(&page->list);
     spin_unlock(&global_lock);
 
-    if (shadow_vaddr) {
+    pr_info("wxshadow: [teardown] %s: addr=%lx state=%d\n",
+            reason, page->page_addr, state);
+
+    /* --- Step 2: disable single-step with validation --- */
+    if (stepping && kfunc_user_disable_single_step) {
+        u64 probe;
+        if (is_kva((unsigned long)stepping) &&
+            safe_read_u64((unsigned long)stepping, &probe)) {
+            kfunc_user_disable_single_step(stepping);
+        } else {
+            pr_warn("wxshadow: [teardown] stepping_task %px stale, skip disable\n",
+                    stepping);
+        }
+    }
+
+    /* --- Step 3: spin for concurrent step-handler (STEPPING race) --- */
+    if (state == WX_STATE_STEPPING) {
+        int w;
+        for (w = 0; w < 50000; w++)
+            cpu_relax();
+    }
+
+    /* --- Step 4: restore PTE to original --- */
+    if (page->mm && page->pfn_original && kfunc_find_vma) {
+        void *mm = page->mm;
+        u64 probe;
+        if (is_kva((unsigned long)mm) &&
+            safe_read_u64((unsigned long)mm, &probe)) {
+            void *vma = kfunc_find_vma(mm, page->page_addr);
+            if (vma && vma_start(vma) <= page->page_addr) {
+                u64 prot = PTE_USER | PTE_RDONLY;  /* r-x */
+                if (wxshadow_switch_mapping(vma, page->page_addr,
+                                            page->pfn_original, prot) == 0) {
+                    wxshadow_flush_icache_page(page->page_addr);
+                }
+            }
+        }
+    }
+
+    /* --- Step 5: free shadow and backup page memory --- */
+    if (shadow_vaddr)
         kfunc_free_pages(shadow_vaddr, 0);
-        pr_info("wxshadow:   Freed shadow page\n");
-    }
-    if (backup_vaddr) {
+    if (backup_vaddr)
         kfunc_free_pages(backup_vaddr, 0);
-        pr_info("wxshadow:   Freed orig_backup page\n");
-    }
 
-    /* Release the list's reference.  The caller still holds its own
-     * reference and must call wxshadow_page_put() when done. */
-    wxshadow_page_put(page);
-
-    pr_info("wxshadow: ===============================================\n");
-    return 0;
+    /* --- Step 6: release list's reference --- */
+    if (was_in_list)
+        wxshadow_page_put(page);
 }
 
 int wxshadow_handle_write_fault(void *mm, unsigned long addr)
@@ -427,9 +453,8 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr)
 
     pr_info("wxshadow: write fault at %lx - page content changing\n", addr);
 
-    /* auto_cleanup releases the list ref; we release the caller ref below. */
-    wxshadow_auto_cleanup_page(page, "Write Fault (page modified)");
-    wxshadow_page_put(page);   /* release caller ref */
+    wxshadow_teardown_page(page, "Write Fault (page modified)");
+    wxshadow_page_put(page);
 
     return -1;
 }
@@ -614,6 +639,18 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         }
     }
 
+    /* Hook follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
+    if (kfunc_follow_page_pte) {
+        ret = hook_wrap5(kfunc_follow_page_pte,
+                         follow_page_pte_before, follow_page_pte_after, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_warn("wxshadow: failed to hook follow_page_pte: %d\n", ret);
+            kfunc_follow_page_pte = NULL;
+        } else {
+            pr_info("wxshadow: hooked follow_page_pte for GUP hiding\n");
+        }
+    }
+
     /* Hook copy_process for fork protection (optional) */
     if (patch_config) {
         unsigned long cp_addr = patch_config->copy_process;
@@ -658,128 +695,16 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     } else {
         pr_info("wxshadow: read hiding DISABLED\n");
     }
+    if (kfunc_follow_page_pte) {
+        pr_info("wxshadow: GUP hiding ENABLED (follow_page_pte hooked)\n");
+    } else {
+        pr_info("wxshadow: GUP hiding DISABLED\n");
+    }
 
     /* Debug: print first 10 processes */
     debug_print_tasks_list(10);
 
     return 0;
-}
-
-/*
- * wxshadow_cleanup_page - fully cleanup a page (restore mapping, free resources).
- *
- * Called during module unload.  The page has already been removed from
- * page_list by the exit loop (list_del_init under global_lock), so no new
- * handler will find it via find_page / find_by_addr.  However a handler that
- * found the page BEFORE the list removal may still hold a caller ref and be
- * running concurrently.
- *
- * Protocol:
- *   1. Mark page dead and capture shadow_page under global_lock.
- *      - Prevents double-free of shadow with concurrent auto_cleanup_page.
- *      - The dead flag tells any concurrent step-handler to skip the
- *        switch-to-shadow PTE operation.
- *   2. Disable single-step on the stepping task if present.
- *   3. If the page was in STEPPING state, spin briefly so that a concurrent
- *      step-handler that already read dead=false has time to complete its
- *      switch-to-shadow before we override with switch-to-original.  After
- *      our switch the PTE is at original; the step-handler's earlier switch
- *      (if it happened) is overridden, and our TLB flush ensures no stale
- *      shadow-page references survive.
- *   4. Restore original PTE (for SHADOW_X / ORIGINAL / STEPPING states).
- *   5. Free shadow page.
- *   6. Release the list's reference via wxshadow_page_put().  If a handler
- *      still holds a ref the struct stays alive until the handler's put.
- */
-static void wxshadow_cleanup_page(struct wxshadow_page *page)
-{
-    void *mm = page->mm;
-    void *stepping;
-    void *vma = NULL;
-    int state;
-    unsigned long shadow_vaddr = 0;
-    unsigned long backup_vaddr = 0;
-    u64 probe;
-
-    /* --- Step 1: mark dead, capture shadow/backup, clear stepping_task --- */
-    spin_lock(&global_lock);
-    page->dead = true;
-    state = page->state;
-    stepping = page->stepping_task;
-    page->stepping_task = NULL;
-    if (page->shadow_page) {
-        shadow_vaddr = (unsigned long)page->shadow_page;
-        page->shadow_page = NULL;
-    }
-    if (page->orig_backup) {
-        backup_vaddr = (unsigned long)page->orig_backup;
-        page->orig_backup = NULL;
-    }
-    spin_unlock(&global_lock);
-
-    pr_info("wxshadow: cleanup page addr=%lx state=%d stepping_task=%px\n",
-            page->page_addr, state, stepping);
-
-    /* --- Step 2: disable single-step --- */
-    if (stepping && kfunc_user_disable_single_step) {
-        if (is_kva((unsigned long)stepping) &&
-            safe_read_u64((unsigned long)stepping, &probe)) {
-            pr_info("wxshadow: disabling single step for task %px\n", stepping);
-            kfunc_user_disable_single_step(stepping);
-        } else {
-            pr_warn("wxshadow: stepping_task %px is stale, skipping disable\n", stepping);
-        }
-    }
-
-    /* --- Step 3: brief spin for any concurrent step-handler --- */
-    if (state == WX_STATE_STEPPING) {
-        /*
-         * A step-handler that read dead=false before Step 1 may be about to
-         * switch PTE to shadow.  We spin briefly so it can complete that
-         * switch; then our switch-to-original below overrides it and the
-         * subsequent TLB flush ensures no CPU executes from the (soon freed)
-         * shadow page.
-         */
-        int w;
-        for (w = 0; w < 50000; w++)
-            cpu_relax();
-    }
-
-    /* --- Step 4: restore original PTE --- */
-    if (mm && kfunc_find_vma && page->pfn_original) {
-        if (is_kva((unsigned long)mm) &&
-            safe_read_u64((unsigned long)mm, &probe)) {
-            vma = kfunc_find_vma(mm, page->page_addr);
-            if (vma && vma_start(vma) <= page->page_addr) {
-                u64 prot = PTE_USER | PTE_RDONLY;  /* r-x */
-                int ret = wxshadow_switch_mapping(vma, page->page_addr,
-                                                  page->pfn_original, prot);
-                if (ret == 0) {
-                    pr_info("wxshadow: restored original mapping addr=%lx pfn=%lx state=%d\n",
-                            page->page_addr, page->pfn_original, state);
-                    wxshadow_flush_icache_page(page->page_addr);
-                } else {
-                    pr_warn("wxshadow: failed to restore mapping for addr=%lx\n",
-                            page->page_addr);
-                }
-            }
-        } else {
-            pr_warn("wxshadow: mm %px is stale, skipping mapping restore\n", mm);
-        }
-    }
-
-    /* --- Step 5: free shadow page and orig_backup --- */
-    if (shadow_vaddr) {
-        kfunc_free_pages(shadow_vaddr, 0);
-        pr_info("wxshadow: freed shadow page for addr=%lx\n", page->page_addr);
-    }
-    if (backup_vaddr) {
-        kfunc_free_pages(backup_vaddr, 0);
-        pr_info("wxshadow: freed orig_backup page for addr=%lx\n", page->page_addr);
-    }
-
-    /* --- Step 6: release list's reference --- */
-    wxshadow_page_put(page);
 }
 
 /*
@@ -853,10 +778,11 @@ static long wxshadow_exit(void *__user reserved)
             break;
         }
         page = list_first_entry(&page_list, struct wxshadow_page, list);
-        list_del_init(&page->list);
+        page->refcount++;  /* caller ref for teardown */
         spin_unlock(&global_lock);
 
-        wxshadow_cleanup_page(page);
+        wxshadow_teardown_page(page, "module unload");
+        wxshadow_page_put(page);  /* release caller ref */
         page_count++;
     }
     pr_info("wxshadow: cleaned %d pages (phase 2)\n", page_count);
@@ -915,6 +841,17 @@ static long wxshadow_exit(void *__user reserved)
         hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
         pr_info("wxshadow: unhooked do_page_fault (phase 4)\n");
         wait_for_handlers_drain("phase4-fault");
+    }
+
+    /*
+     * Phase 4.5: Unhook access_remote_vm.
+     * page_list is empty; handler will find no overlapping pages.
+     */
+    if (kfunc_follow_page_pte) {
+        hook_unwrap(kfunc_follow_page_pte, follow_page_pte_before,
+                    follow_page_pte_after);
+        pr_info("wxshadow: unhooked follow_page_pte (phase 4.5)\n");
+        wait_for_handlers_drain("phase4.5-follow_page_pte");
     }
 
     /*
