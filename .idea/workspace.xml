@@ -4,7 +4,9 @@
     <option name="autoReloadType" value="SELECTIVE" />
   </component>
   <component name="BackendCodeEditorMiscSettings">
+    <option name="/Default/Environment/Hierarchy/GeneratedFilesCacheKey/Timestamp/@EntryValue" value="3" type="long" />
     <option name="/Default/Housekeeping/FeatureSuggestion/FeatureSuggestionManager/DisabledSuggesters/=SwitchToGoToActionSuggester/@EntryIndexedValue" value="true" type="bool" />
+    <option name="/Default/Housekeeping/GlobalSettingsUpgraded/IsUpgraded/@EntryValue" value="true" type="bool" />
   </component>
   <component name="CMakePresetLoader">{
   &quot;useNewFormat&quot;: true
@@ -17,37 +19,46 @@
   </component>
   <component name="CMakeRunConfigurationManager">
     <generated>
-      <config projectName="apps" targetName="clean-all-demos" />
-      <config projectName="apps" targetName="inlinehook_obj" />
+      <config projectName="apps" targetName="wxshadow_obj" />
       <config projectName="apps" targetName="syscallhook.kpm" />
-      <config projectName="apps" targetName="hide-maps.kpm" />
-      <config projectName="apps" targetName="inlinehook.kpm" />
-      <config projectName="apps" targetName="clean-syscallhook" />
       <config projectName="apps" targetName="clean-hide-maps" />
+      <config projectName="apps" targetName="inlinehook_obj" />
+      <config projectName="apps" targetName="hide-maps_obj" />
+      <config projectName="apps" targetName="clean-hello" />
+      <config projectName="apps" targetName="clean-wxshadow" />
+      <config projectName="apps" targetName="clean-all-demos" />
+      <config projectName="apps" targetName="clean-syscallhook" />
+      <config projectName="apps" targetName="anti-detect.kpm" />
+      <config projectName="apps" targetName="wxshadow.kpm" />
+      <config projectName="apps" targetName="syscallhook_obj" />
+      <config projectName="apps" targetName="clean-anti-detect" />
+      <config projectName="apps" targetName="test_pmd_split" />
+      <config projectName="apps" targetName="anti-detect_obj" />
+      <config projectName="apps" targetName="wxshadow_client" />
       <config projectName="apps" targetName="clean-inlinehook" />
       <config projectName="apps" targetName="hello.kpm" />
-      <config projectName="apps" targetName="clean-hello" />
+      <config projectName="apps" targetName="inlinehook.kpm" />
       <config projectName="apps" targetName="hello_obj" />
-      <config projectName="apps" targetName="syscallhook_obj" />
-      <config projectName="apps" targetName="hide-maps_obj" />
+      <config projectName="apps" targetName="hide-maps.kpm" />
     </generated>
   </component>
   <component name="CMakeSettings">
     <configurations>
-      <configuration PROFILE_NAME="Debug" ENABLED="true" CONFIG_NAME="Debug" />
+      <configuration PROFILE_NAME="Debug" ENABLED="true" CONFIG_NAME="Debug" GENERATION_OPTIONS="-DCMAKE_C_COMPILER=aarch64-linux-gnu-gcc" />
     </configurations>
   </component>
   <component name="ChangeListManager">
-    <list default="true" id="12ffc765-530f-43b0-ab74-81a3d2476c80" name="更改" comment="idea">
-      <change afterPath="$PROJECT_DIR$/kpms/hide-maps/.Makefile.swp" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/kpms/hide-maps/.gitignore" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/kpms/hide-maps/CMakeLists.txt" afterDir="false" />
-      <change afterPath="$PROJECT_DIR$/kpms/hide-maps/hidemaps.c" afterDir="false" />
+    <list default="true" id="12ffc765-530f-43b0-ab74-81a3d2476c80" name="更改" comment="hidemaps 隐藏指定段">
+      <change beforePath="$PROJECT_DIR$/.idea/editor.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/editor.xml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/mkpms.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/mkpms.iml" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/demo-hello/Makefile" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/demo-hello/hello.lds" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/demo-inlinehook/Makefile" beforeDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/demo-syscallhook/Makefile" beforeDir="false" />
+      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/anti-detect/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/anti-detect/CMakeLists.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/anti-detect/anti-detect.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/anti-detect/anti-detect.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/CMakeLists.txt" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_pgtable.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_pgtable.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_scan.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_scan.c" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -68,9 +79,26 @@
   <component name="Git.Settings">
     <option name="RECENT_GIT_ROOT_PATH" value="$PROJECT_DIR$" />
   </component>
+  <component name="GitHubPullRequestSearchHistory">{
+  &quot;lastFilter&quot;: {
+    &quot;state&quot;: &quot;OPEN&quot;,
+    &quot;assignee&quot;: &quot;kkkbbb&quot;
+  }
+}</component>
+  <component name="GithubPullRequestsUISettings">{
+  &quot;selectedUrlAndAccountId&quot;: {
+    &quot;url&quot;: &quot;https://github.com/kkkbbb/mkpms.git&quot;,
+    &quot;accountId&quot;: &quot;ae2b6a50-14c4-4f84-aa85-9985a3df8189&quot;
+  }
+}</component>
   <component name="HighlightingSettingsPerFile">
     <setting file="file://$PROJECT_DIR$/kernel/include/hook.h" root0="FORCE_HIGHLIGHTING" />
     <setting file="file://$PROJECT_DIR$/kernel/include/kpmodule.h" root0="FORCE_HIGHLIGHTING" />
+    <setting file="file://$PROJECT_DIR$/kernel/linux/include/linux/printk.h" root0="FORCE_HIGHLIGHTING" />
+    <setting file="file://$PROJECT_DIR$/kpms/wxshadow/wxshadow.h" root0="FORCE_HIGHLIGHTING" />
+  </component>
+  <component name="MacroExpansionManager">
+    <option name="directoryName" value="nqah1DJE" />
   </component>
   <component name="ProjectApplicationVersion">
     <option name="ide" value="CLion" />
@@ -93,21 +121,23 @@
     &quot;RunOnceActivity.RadMigrateCodeStyle&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.ShowReadmeOnStart&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.TerminalTabsStorage.copyFrom.TerminalArrangementManager.252&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.cidr.known.project.marker&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.git.unshallow&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.readMode.enableVisualFormatting&quot;: &quot;true&quot;,
+    &quot;RunOnceActivity.typescript.service.memoryLimit.init&quot;: &quot;true&quot;,
     &quot;RunOnceActivity.west.config.association.type.startup.service&quot;: &quot;true&quot;,
     &quot;SHARE_PROJECT_CONFIGURATION_FILES&quot;: &quot;true&quot;,
     &quot;cf.first.check.clang-format&quot;: &quot;false&quot;,
     &quot;cidr.known.project.marker&quot;: &quot;true&quot;,
     &quot;git-widget-placeholder&quot;: &quot;master&quot;,
-    &quot;last_opened_file_path&quot;: &quot;/home/wwb/mkpms/kpms&quot;,
+    &quot;last_opened_file_path&quot;: &quot;/home/wwb/mkpms&quot;,
     &quot;node.js.detected.package.eslint&quot;: &quot;true&quot;,
     &quot;node.js.detected.package.tslint&quot;: &quot;true&quot;,
     &quot;node.js.selected.package.eslint&quot;: &quot;(autodetect)&quot;,
     &quot;node.js.selected.package.tslint&quot;: &quot;(autodetect)&quot;,
     &quot;nodejs_package_manager_path&quot;: &quot;npm&quot;,
-    &quot;settings.editor.selected.configurable&quot;: &quot;CMakeSettings&quot;,
+    &quot;settings.editor.selected.configurable&quot;: &quot;preferences.pluginManager&quot;,
     &quot;vue.rearranger.settings.migration&quot;: &quot;true&quot;
   }
 }</component>
@@ -117,8 +147,38 @@
       <recent name="$PROJECT_DIR$" />
     </key>
   </component>
-  <component name="RunManager" selected="CMake 应用程序.hide-maps.kpm">
+  <component name="RunManager" selected="CMake 应用程序.wxshadow.kpm">
+    <configuration default="true" type="CLionExternalRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true">
+      <method v="2">
+        <option name="CLION.EXTERNAL.BUILD" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="anti-detect.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="anti-detect.kpm" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="anti-detect_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="anti-detect_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="clean-all-demos" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-all-demos" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-all-demos" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-all-demos" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-anti-detect" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-anti-detect" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-hello" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-hello" CONFIG_NAME="Debug">
       <method v="2">
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
@@ -133,12 +193,37 @@
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
     </configuration>
+    <configuration name="clean-hide-maps" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-hide-maps" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-inlinehook" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-inlinehook" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="clean-inlinehook" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-inlinehook" CONFIG_NAME="Debug">
       <method v="2">
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
     </configuration>
     <configuration name="clean-syscallhook" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-syscallhook" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-syscallhook" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-syscallhook" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="clean-wxshadow" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="clean-wxshadow" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="hello.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="hello.kpm" CONFIG_NAME="Debug">
       <method v="2">
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
@@ -153,7 +238,22 @@
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
     </configuration>
+    <configuration name="hello_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="hello_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="hide-maps.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="hide-maps.kpm" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="hide-maps.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="hide-maps.kpm" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="hide-maps_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="hide-maps_obj" CONFIG_NAME="Debug">
       <method v="2">
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
@@ -168,7 +268,22 @@
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
     </configuration>
+    <configuration name="inlinehook.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="inlinehook.kpm" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
     <configuration name="inlinehook_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="inlinehook_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="inlinehook_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="inlinehook_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="syscallhook.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="syscallhook.kpm" CONFIG_NAME="Debug">
       <method v="2">
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
@@ -183,20 +298,53 @@
         <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
       </method>
     </configuration>
+    <configuration name="syscallhook_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="syscallhook_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="test_pmd_split" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="test_pmd_split" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="apps" RUN_TARGET_NAME="test_pmd_split">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="wxshadow_client" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="wxshadow_client" CONFIG_NAME="Debug" RUN_TARGET_PROJECT_NAME="apps" RUN_TARGET_NAME="wxshadow_client">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="wxshadow.kpm" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="wxshadow.kpm" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
+    <configuration name="wxshadow_obj" type="CMakeRunConfiguration" factoryName="Application" REDIRECT_INPUT="false" ELEVATE="false" USE_EXTERNAL_CONSOLE="false" EMULATE_TERMINAL="false" PASS_PARENT_ENVS_2="true" PROJECT_NAME="apps" TARGET_NAME="wxshadow_obj" CONFIG_NAME="Debug">
+      <method v="2">
+        <option name="com.jetbrains.cidr.execution.CidrBuildBeforeRunTaskProvider$BuildBeforeRunTask" enabled="true" />
+      </method>
+    </configuration>
     <list>
       <item itemvalue="CMake 应用程序.clean-all-demos" />
+      <item itemvalue="CMake 应用程序.clean-anti-detect" />
       <item itemvalue="CMake 应用程序.clean-hello" />
       <item itemvalue="CMake 应用程序.clean-hide-maps" />
       <item itemvalue="CMake 应用程序.clean-inlinehook" />
       <item itemvalue="CMake 应用程序.clean-syscallhook" />
+      <item itemvalue="CMake 应用程序.clean-wxshadow" />
       <item itemvalue="CMake 应用程序.hello.kpm" />
       <item itemvalue="CMake 应用程序.hello_obj" />
       <item itemvalue="CMake 应用程序.hide-maps.kpm" />
       <item itemvalue="CMake 应用程序.hide-maps_obj" />
+      <item itemvalue="CMake 应用程序.test_pmd_split" />
       <item itemvalue="CMake 应用程序.inlinehook.kpm" />
       <item itemvalue="CMake 应用程序.inlinehook_obj" />
       <item itemvalue="CMake 应用程序.syscallhook.kpm" />
       <item itemvalue="CMake 应用程序.syscallhook_obj" />
+      <item itemvalue="CMake 应用程序.wxshadow_client" />
+      <item itemvalue="CMake 应用程序.wxshadow.kpm" />
+      <item itemvalue="CMake 应用程序.wxshadow_obj" />
+      <item itemvalue="CMake 应用程序.anti-detect.kpm" />
+      <item itemvalue="CMake 应用程序.anti-detect_obj" />
     </list>
   </component>
   <component name="TaskManager">
@@ -213,6 +361,21 @@
       <workItem from="1756888240931" duration="2181000" />
       <workItem from="1757295077697" duration="17777000" />
       <workItem from="1758346091436" duration="2000" />
+      <workItem from="1767881000641" duration="2035000" />
+      <workItem from="1767922433601" duration="1201000" />
+      <workItem from="1770865706091" duration="15588000" />
+      <workItem from="1770980666525" duration="209000" />
+      <workItem from="1770980902346" duration="152000" />
+      <workItem from="1770981136929" duration="505000" />
+      <workItem from="1770981898095" duration="246000" />
+      <workItem from="1770982161175" duration="49000" />
+      <workItem from="1770982237106" duration="651000" />
+      <workItem from="1772000636275" duration="4277000" />
+      <workItem from="1772035779406" duration="11000" />
+      <workItem from="1772076647700" duration="7889000" />
+      <workItem from="1772417857089" duration="5732000" />
+      <workItem from="1772707571131" duration="9518000" />
+      <workItem from="1772768063219" duration="8355000" />
     </task>
     <task id="LOCAL-00001" summary="init">
       <option name="closed" value="true" />
@@ -230,7 +393,15 @@
       <option name="project" value="LOCAL" />
       <updated>1751868616075</updated>
     </task>
-    <option name="localTasksCounter" value="3" />
+    <task id="LOCAL-00003" summary="hidemaps 隐藏指定段">
+      <option name="closed" value="true" />
+      <created>1772593572189</created>
+      <option name="number" value="00003" />
+      <option name="presentableId" value="LOCAL-00003" />
+      <option name="project" value="LOCAL" />
+      <updated>1772593572189</updated>
+    </task>
+    <option name="localTasksCounter" value="4" />
     <servers />
   </component>
   <component name="TypeScriptGeneratedFilesManager">
@@ -255,7 +426,8 @@
   <component name="VcsManagerConfiguration">
     <MESSAGE value="init" />
     <MESSAGE value="idea" />
-    <option name="LAST_COMMIT_MESSAGE" value="idea" />
+    <MESSAGE value="hidemaps 隐藏指定段" />
+    <option name="LAST_COMMIT_MESSAGE" value="hidemaps 隐藏指定段" />
   </component>
   <component name="XSLT-Support.FileAssociations.UIState">
     <expand />
