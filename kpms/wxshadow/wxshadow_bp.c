@@ -533,62 +533,28 @@ int wxshadow_do_del_bp(void *mm, unsigned long addr)
     return 0;
 }
 
-/* ========== Delete all breakpoints for mm ========== */
-
-/*
- * collect_and_release_pages - iteratively find and teardown all pages for mm.
- *
- * Uses wxshadow_teardown_page for each page, which handles all cleanup
- * (mark dead, disable single-step, restore PTE, free shadow/backup).
- */
-static int collect_and_release_pages(void *mm)
-{
-    struct list_head *pos;
-    struct wxshadow_page *page;
-    int count = 0;
-
-    while (1) {
-        page = NULL;
-        spin_lock(&global_lock);
-        list_for_each(pos, &page_list) {
-            struct wxshadow_page *p =
-                container_of(pos, struct wxshadow_page, list);
-            if (p->mm == mm) {
-                p->refcount++;  /* caller ref */
-                page = p;
-                break;
-            }
-        }
-        spin_unlock(&global_lock);
-
-        if (!page)
-            break;
-
-        wxshadow_teardown_page(page, "release_all");
-        wxshadow_page_put(page);
-        count++;
-    }
-
-    if (count > 0)
-        pr_info("wxshadow: [release_all] cleaned up %d pages\n", count);
-    return 0;
-}
-
-int wxshadow_do_del_all_bp(void *mm)
-{
-    pr_info("wxshadow: [del_all_bp] mm=%px\n", mm);
-    return collect_and_release_pages(mm);
-}
-
-/* ========== Release all shadow pages for mm ========== */
-
-int wxshadow_do_release_all(void *mm)
-{
-    pr_info("wxshadow: [release_all] mm=%px\n", mm);
-    return collect_and_release_pages(mm);
-}
-
 /* ========== prctl hook ========== */
+
+/* Resolve pid to mm_struct. Returns mm with refcount held (caller must mmput). */
+static void *resolve_pid_to_mm(pid_t pid)
+{
+    void *mm;
+
+    if (pid == 0)
+        return kfunc_get_task_mm(current);
+
+    kfunc_rcu_read_lock();
+    {
+        void *task = wxfunc(find_task_by_vpid)(pid);
+        if (!task) {
+            kfunc_rcu_read_unlock();
+            return NULL;
+        }
+        mm = kfunc_get_task_mm(task);
+    }
+    kfunc_rcu_read_unlock();
+    return mm;
+}
 
 void prctl_before(hook_fargs4_t *args, void *udata)
 {
@@ -598,57 +564,23 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     unsigned long arg4 = syscall_argn(args, 3);
     unsigned long arg5 = syscall_argn(args, 4);
     void *mm;
-    void *task;
-    int ret = -22;  /* EINVAL */
+    int ret;
     pid_t pid;
 
     /* Lazy scan mm->context.id offset on first wxshadow prctl call */
     if (option == PR_WXSHADOW_SET_BP || option == PR_WXSHADOW_SET_REG ||
         option == PR_WXSHADOW_DEL_BP || option == PR_WXSHADOW_PATCH ||
         option == PR_WXSHADOW_RELEASE) {
-        if (mm_context_id_offset < 0) {
-            /* Now in user process context, TTBR0 should have valid ASID */
+        if (mm_context_id_offset < 0)
             try_scan_mm_context_id_offset();
-        }
     }
 
     switch (option) {
     case PR_WXSHADOW_SET_BP:
         pid = (pid_t)arg2;
-        pr_info("wxshadow: [prctl] SET_BP pid=%d addr=%lx\n", pid, arg3);
-        if (pid == 0) {
-            pr_info("wxshadow: [prctl] SET_BP using current task\n");
-            mm = kfunc_get_task_mm(current);
-            if (!mm) {
-                pr_err("wxshadow: [prctl] SET_BP get_task_mm(current) failed\n");
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        } else {
-            pr_info("wxshadow: [prctl] SET_BP looking up pid=%d\n", pid);
-            kfunc_rcu_read_lock();
-            task = wxfunc(find_task_by_vpid)(pid);
-            if (!task) {
-                pr_err("wxshadow: [prctl] SET_BP find_task_by_vpid failed\n");
-                kfunc_rcu_read_unlock();
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-            pr_info("wxshadow: [prctl] SET_BP found task=%px\n", task);
-            mm = kfunc_get_task_mm(task);
-            kfunc_rcu_read_unlock();
-            if (!mm) {
-                pr_err("wxshadow: [prctl] SET_BP get_task_mm failed\n");
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        }
-        pr_info("wxshadow: [prctl] SET_BP mm=%px, calling do_set_bp\n", mm);
+        mm = resolve_pid_to_mm(pid);
+        if (!mm) { args->ret = -3; args->skip_origin = 1; return; }
         ret = wxshadow_do_set_bp(mm, arg3);
-        pr_info("wxshadow: [prctl] SET_BP do_set_bp returned %d\n", ret);
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
@@ -656,30 +588,8 @@ void prctl_before(hook_fargs4_t *args, void *udata)
 
     case PR_WXSHADOW_SET_REG:
         pid = (pid_t)arg2;
-        if (pid == 0) {
-            mm = kfunc_get_task_mm(current);
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        } else {
-            kfunc_rcu_read_lock();
-            task = wxfunc(find_task_by_vpid)(pid);
-            if (!task) {
-                kfunc_rcu_read_unlock();
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-            mm = kfunc_get_task_mm(task);
-            kfunc_rcu_read_unlock();
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        }
+        mm = resolve_pid_to_mm(pid);
+        if (!mm) { args->ret = -3; args->skip_origin = 1; return; }
         ret = wxshadow_do_set_reg(mm, arg3, (unsigned int)arg4, arg5);
         kfunc_mmput(mm);
         args->ret = ret;
@@ -688,44 +598,23 @@ void prctl_before(hook_fargs4_t *args, void *udata)
 
     case PR_WXSHADOW_DEL_BP:
         pid = (pid_t)arg2;
-        if (pid == 0) {
-            mm = kfunc_get_task_mm(current);
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
+        mm = resolve_pid_to_mm(pid);
+        if (!mm) { args->ret = -3; args->skip_origin = 1; return; }
+        if (arg3 == 0) {
+            wxshadow_teardown_pages_for_mm(mm, "del_all_bp");
+            ret = 0;
         } else {
-            kfunc_rcu_read_lock();
-            task = wxfunc(find_task_by_vpid)(pid);
-            if (!task) {
-                kfunc_rcu_read_unlock();
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-            mm = kfunc_get_task_mm(task);
-            kfunc_rcu_read_unlock();
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        }
-        if (arg3 == 0)
-            ret = wxshadow_do_del_all_bp(mm);
-        else
             ret = wxshadow_do_del_bp(mm, arg3);
+        }
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
 
     case PR_WXSHADOW_SET_TLB_MODE:
-        /* arg2 = mode (0=auto, 1=precise, 2=broadcast, 3=full) */
         if (arg2 > WX_TLB_MODE_FULL) {
             pr_err("wxshadow: [prctl] invalid TLB mode: %lu\n", arg2);
-            args->ret = -22;  /* EINVAL */
+            args->ret = -22;
         } else {
             int old_mode = tlb_flush_mode;
             tlb_flush_mode = (int)arg2;
@@ -737,40 +626,14 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         break;
 
     case PR_WXSHADOW_GET_TLB_MODE:
-        /* Return current TLB flush mode */
         args->ret = tlb_flush_mode;
         args->skip_origin = 1;
-        pr_info("wxshadow: [prctl] GET_TLB_MODE = %d\n", tlb_flush_mode);
         break;
 
     case PR_WXSHADOW_PATCH:
         pid = (pid_t)arg2;
-        pr_info("wxshadow: [prctl] PATCH pid=%d addr=%lx buf=%lx len=%lu\n",
-                pid, arg3, arg4, arg5);
-        if (pid == 0) {
-            mm = kfunc_get_task_mm(current);
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        } else {
-            kfunc_rcu_read_lock();
-            task = wxfunc(find_task_by_vpid)(pid);
-            if (!task) {
-                kfunc_rcu_read_unlock();
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-            mm = kfunc_get_task_mm(task);
-            kfunc_rcu_read_unlock();
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        }
+        mm = resolve_pid_to_mm(pid);
+        if (!mm) { args->ret = -3; args->skip_origin = 1; return; }
         ret = wxshadow_do_patch(mm, arg3, (void __user *)arg4, arg5);
         kfunc_mmput(mm);
         args->ret = ret;
@@ -779,42 +642,20 @@ void prctl_before(hook_fargs4_t *args, void *udata)
 
     case PR_WXSHADOW_RELEASE:
         pid = (pid_t)arg2;
-        pr_info("wxshadow: [prctl] RELEASE pid=%d addr=%lx\n", pid, arg3);
-        if (pid == 0) {
-            mm = kfunc_get_task_mm(current);
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
+        mm = resolve_pid_to_mm(pid);
+        if (!mm) { args->ret = -3; args->skip_origin = 1; return; }
+        if (arg3 == 0) {
+            wxshadow_teardown_pages_for_mm(mm, "release_all");
+            ret = 0;
         } else {
-            kfunc_rcu_read_lock();
-            task = wxfunc(find_task_by_vpid)(pid);
-            if (!task) {
-                kfunc_rcu_read_unlock();
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-            mm = kfunc_get_task_mm(task);
-            kfunc_rcu_read_unlock();
-            if (!mm) {
-                args->ret = -3;
-                args->skip_origin = 1;
-                return;
-            }
-        }
-        if (arg3 == 0)
-            ret = wxshadow_do_release_all(mm);
-        else
             ret = wxshadow_do_release(mm, arg3);
+        }
         kfunc_mmput(mm);
         args->ret = ret;
         args->skip_origin = 1;
         break;
 
     default:
-        /* Not our prctl, let it pass through */
         break;
     }
 }

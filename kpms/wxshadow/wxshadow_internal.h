@@ -453,6 +453,7 @@ void wxshadow_free_page(struct wxshadow_page *page);
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long addr);
 int wxshadow_validate_page_mapping(void *mm, void *vma, struct wxshadow_page *page_info, unsigned long page_addr);
 void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason);
+int wxshadow_teardown_pages_for_mm(void *mm, const char *reason);
 int wxshadow_handle_write_fault(void *mm, unsigned long addr);
 
 /* ========== Page table functions (wxshadow_pgtable.c) ========== */
@@ -488,10 +489,8 @@ void single_step_handler_before(hook_fargs3_t *args, void *udata);
 int wxshadow_do_set_bp(void *mm, unsigned long addr);
 int wxshadow_do_set_reg(void *mm, unsigned long addr, unsigned int reg_idx, unsigned long value);
 int wxshadow_do_del_bp(void *mm, unsigned long addr);
-int wxshadow_do_del_all_bp(void *mm);
 int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned long len);
 int wxshadow_do_release(void *mm, unsigned long addr);
-int wxshadow_do_release_all(void *mm);
 void prctl_before(hook_fargs4_t *args, void *udata);
 
 /* ========== Scan functions (wxshadow_scan.c) ========== */

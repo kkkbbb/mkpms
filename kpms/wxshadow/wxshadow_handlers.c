@@ -361,38 +361,15 @@ void follow_page_pte_after(hook_fargs5_t *args, void *udata)
 static void exit_mmap_before_impl(hook_fargs1_t *args, void *udata)
 {
     void *mm = (void *)args->arg0;
-    struct list_head *pos;
-    int nr_pages = 0;
+    int nr;
 
     if (!mm)
         return;
 
-    while (1) {
-        struct wxshadow_page *page = NULL;
-
-        spin_lock(&global_lock);
-        list_for_each(pos, &page_list) {
-            struct wxshadow_page *p =
-                container_of(pos, struct wxshadow_page, list);
-            if (p->mm == mm) {
-                p->refcount++;  /* caller ref */
-                page = p;
-                break;
-            }
-        }
-        spin_unlock(&global_lock);
-
-        if (!page)
-            break;
-
-        wxshadow_teardown_page(page, "exit_mmap");
-        wxshadow_page_put(page);
-        nr_pages++;
-    }
-
-    if (nr_pages > 0)
+    nr = wxshadow_teardown_pages_for_mm(mm, "exit_mmap");
+    if (nr > 0)
         pr_info("wxshadow: [exit_mmap] cleanup complete for mm=%px (%d pages)\n",
-                mm, nr_pages);
+                mm, nr);
 }
 
 void exit_mmap_before(hook_fargs1_t *args, void *udata)
@@ -469,78 +446,42 @@ static void wxshadow_fix_child_ptes(void *parent_mm, void *child_mm)
     } while (nr == FORK_FIX_BATCH);  /* Loop if batch was full (more pages) */
 }
 
-/*
- * after_copy_process_wx - hook callback after copy_process returns.
- *
- * copy_process returns the new task_struct * in args->ret.
- * The parent is `current`.
- */
-void after_copy_process_wx(hook_fargs8_t *args, void *udata)
+static void wxshadow_handle_fork(struct task_struct *new_task)
 {
-    struct task_struct *new_task;
     void *parent_mm;
     void *child_mm = NULL;
 
-    WX_HANDLER_ENTER();
-
-    new_task = (struct task_struct *)args->ret;
-    if (!new_task || IS_ERR(new_task))
-        goto out;
-
     parent_mm = kfunc_get_task_mm(current);
     if (!parent_mm)
-        goto out;
+        return;
 
-    /* Read child's mm from task->mm_offset */
     if (task_struct_offset.mm_offset >= 0)
         safe_read_ptr((unsigned long)new_task + task_struct_offset.mm_offset, &child_mm);
 
     if (!child_mm || child_mm == parent_mm) {
-        /* NULL mm (kernel thread) or same mm (CLONE_VM / thread) — nothing to fix */
         kfunc_mmput(parent_mm);
-        goto out;
+        return;
     }
 
     wxshadow_fix_child_ptes(parent_mm, child_mm);
     kfunc_mmput(parent_mm);
+}
 
-out:
+void after_copy_process_wx(hook_fargs8_t *args, void *udata)
+{
+    struct task_struct *new_task = (struct task_struct *)args->ret;
+
+    WX_HANDLER_ENTER();
+    if (new_task && !IS_ERR(new_task))
+        wxshadow_handle_fork(new_task);
     WX_HANDLER_EXIT();
 }
 
-/*
- * after_cgroup_post_fork_wx - fallback hook when copy_process is unavailable.
- *
- * cgroup_post_fork(struct task_struct *child, ...) — child is arg0.
- */
 void after_cgroup_post_fork_wx(hook_fargs4_t *args, void *udata)
 {
-    struct task_struct *new_task;
-    void *parent_mm;
-    void *child_mm = NULL;
-
     WX_HANDLER_ENTER();
-
-    new_task = (struct task_struct *)args->arg0;
-    if (!new_task)
-        goto out;
-
-    parent_mm = kfunc_get_task_mm(current);
-    if (!parent_mm)
-        goto out;
-
-    if (task_struct_offset.mm_offset >= 0)
-        safe_read_ptr((unsigned long)new_task + task_struct_offset.mm_offset, &child_mm);
-
-    if (!child_mm || child_mm == parent_mm) {
-        kfunc_mmput(parent_mm);
-        goto out;
-    }
-
-    wxshadow_fix_child_ptes(parent_mm, child_mm);
-    kfunc_mmput(parent_mm);
-
-out:
+    if (args->arg0)
+        wxshadow_handle_fork((struct task_struct *)args->arg0);
     WX_HANDLER_EXIT();
 }
 

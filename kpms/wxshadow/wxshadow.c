@@ -438,6 +438,44 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
         wxshadow_page_put(page);
 }
 
+/*
+ * wxshadow_teardown_pages_for_mm - iteratively teardown all pages for a given mm.
+ * If mm is NULL, teardown all pages (used during module unload).
+ * Returns the number of pages cleaned up.
+ */
+int wxshadow_teardown_pages_for_mm(void *mm, const char *reason)
+{
+    struct list_head *pos;
+    struct wxshadow_page *page;
+    int count = 0;
+
+    while (1) {
+        page = NULL;
+        spin_lock(&global_lock);
+        list_for_each(pos, &page_list) {
+            struct wxshadow_page *p =
+                container_of(pos, struct wxshadow_page, list);
+            if (!mm || p->mm == mm) {
+                p->refcount++;
+                page = p;
+                break;
+            }
+        }
+        spin_unlock(&global_lock);
+
+        if (!page)
+            break;
+
+        wxshadow_teardown_page(page, reason);
+        wxshadow_page_put(page);
+        count++;
+    }
+
+    if (count > 0)
+        pr_info("wxshadow: [%s] cleaned up %d pages\n", reason, count);
+    return count;
+}
+
 int wxshadow_handle_write_fault(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page;
@@ -750,7 +788,6 @@ static void wait_for_handlers_drain(const char *phase)
 
 static long wxshadow_exit(void *__user reserved)
 {
-    struct wxshadow_page *page;
     int page_count = 0;
 
     pr_info("wxshadow: unloading...\n");
@@ -771,21 +808,7 @@ static long wxshadow_exit(void *__user reserved)
      * BRK/step handlers are still active and will find no page once
      * it has been popped here.
      */
-    while (1) {
-        spin_lock(&global_lock);
-        if (list_empty(&page_list)) {
-            spin_unlock(&global_lock);
-            break;
-        }
-        page = list_first_entry(&page_list, struct wxshadow_page, list);
-        page->refcount++;  /* caller ref for teardown */
-        spin_unlock(&global_lock);
-
-        wxshadow_teardown_page(page, "module unload");
-        wxshadow_page_put(page);  /* release caller ref */
-        page_count++;
-    }
-    pr_info("wxshadow: cleaned %d pages (phase 2)\n", page_count);
+    page_count = wxshadow_teardown_pages_for_mm(NULL, "module unload");
 
     /*
      * Phase 2.5: Unhook fork protection (copy_process / cgroup_post_fork).
