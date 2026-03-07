@@ -37,6 +37,23 @@ static inline void cpu_relax(void)
 }
 
 /*
+ * Per-page PTE rewrite lock.
+ * This is a logical lock, not the kernel page-table lock: it serializes
+ * wxshadow's own PTE transitions (shadow/original/backup) for one page so
+ * release/fault/step/GUP paths cannot race each other.
+ */
+static inline void wxshadow_page_pte_lock(struct wxshadow_page *page)
+{
+    while (atomic_cmpxchg(&page->pte_lock, 0, 1) != 0)
+        cpu_relax();
+}
+
+static inline void wxshadow_page_pte_unlock(struct wxshadow_page *page)
+{
+    atomic_set(&page->pte_lock, 0);
+}
+
+/*
  * Use task_struct_offset from KernelPatch framework (linux/sched.h)
  * The framework provides: comm_offset, cred_offset, real_cred_offset, etc.
  * We need to detect: tasks_offset, mm_offset
@@ -452,8 +469,9 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr);
 void wxshadow_free_page(struct wxshadow_page *page);
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long addr);
 int wxshadow_validate_page_mapping(void *mm, void *vma, struct wxshadow_page *page_info, unsigned long page_addr);
-void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason);
+int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason);
 int wxshadow_teardown_pages_for_mm(void *mm, const char *reason);
+int wxshadow_release_pages_for_mm(void *mm, const char *reason);
 int wxshadow_handle_write_fault(void *mm, unsigned long addr);
 
 /* ========== Page table functions (wxshadow_pgtable.c) ========== */
@@ -461,10 +479,29 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr);
 u64 *get_user_pte(void *mm, unsigned long addr, void **ptlp);
 int wxshadow_try_split_pmd(void *mm, void *vma, unsigned long addr);
 void pte_unmap_unlock(u64 *pte, void *ptl);
-void wxshadow_set_pte_at(void *mm, unsigned long addr, u64 *ptep, u64 pte);
 void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr);
 u64 make_pte(unsigned long pfn, u64 prot);
-int wxshadow_switch_mapping(void *vma, unsigned long addr, unsigned long target_pfn, u64 prot);
+int wxshadow_page_activate_shadow(struct wxshadow_page *page, void *vma,
+                                  unsigned long addr);
+int wxshadow_page_enter_original(struct wxshadow_page *page, void *vma,
+                                 unsigned long addr);
+int wxshadow_page_resume_shadow(struct wxshadow_page *page, void *vma,
+                                unsigned long addr);
+int wxshadow_page_begin_stepping(struct wxshadow_page *page, void *vma,
+                                 unsigned long addr, void *task);
+int wxshadow_page_finish_stepping(struct wxshadow_page *page, void *vma,
+                                  unsigned long addr, void *task);
+int wxshadow_page_restore_original_for_teardown_locked(
+    struct wxshadow_page *page, void *vma, unsigned long addr);
+int wxshadow_page_begin_gup_hide(struct wxshadow_page *page, void *mm,
+                                 unsigned long addr, u64 **out_ptep,
+                                 u64 *out_orig_pte);
+int wxshadow_page_finish_gup_hide(struct wxshadow_page *page, void *vma,
+                                  unsigned long addr, u64 *ptep,
+                                  u64 orig_pte);
+int wxshadow_page_restore_child_original_locked(struct wxshadow_page *page,
+                                                void *child_mm,
+                                                unsigned long addr);
 
 /* ========== Fork handler (wxshadow_handlers.c) ========== */
 

@@ -166,6 +166,8 @@ static struct wx_step_hook wxshadow_step_hook = {
 
 /* ========== Reference counting helpers ========== */
 
+#define WXSHADOW_RELEASE_WAIT_LOOPS 2000000
+
 /*
  * wxshadow_page_put - release one reference.
  * kfree's the struct when refcount reaches zero.
@@ -243,6 +245,7 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
     page->state = WX_STATE_NONE;
     page->refcount = 2;            /* list ref + caller ref */
     page->dead = false;
+    atomic_set(&page->pte_lock, 0);
     INIT_LIST_HEAD(&page->list);
 
     spin_lock(&global_lock);
@@ -336,6 +339,29 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
     return 0;
 }
 
+static int wxshadow_wait_for_teardown(struct wxshadow_page *page,
+                                      const char *reason)
+{
+    int i;
+
+    for (i = 0; i < WXSHADOW_RELEASE_WAIT_LOOPS; i++) {
+        bool done;
+
+        spin_lock(&global_lock);
+        done = page->dead;
+        spin_unlock(&global_lock);
+
+        if (done)
+            return 0;
+
+        cpu_relax();
+    }
+
+    pr_warn("wxshadow: [teardown] timeout waiting for step completion at addr=%lx during %s\n",
+            page->page_addr, reason);
+    return -16;  /* EBUSY */
+}
+
 /*
  * wxshadow_teardown_page - unified page cleanup.
  *
@@ -358,39 +384,45 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
  * Safe to call even if the page has already been removed from page_list
  * (list_del_init is idempotent on an initialized-but-empty node).
  */
-void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
+int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
 {
     void *stepping = NULL;
     int state;
     bool was_in_list;
+    int ret = 0;
 
     if (!page)
-        return;
+        return 0;
 
-    /* --- Step 1: mark dead, remove from list --- */
+    wxshadow_page_pte_lock(page);
+
     spin_lock(&global_lock);
-    page->dead = true;
+    if (page->dead) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        return 0;
+    }
+
     state = page->state;
+    page->release_pending = true;
+    if (state == WX_STATE_STEPPING &&
+        page->stepping_task && page->stepping_task != current) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        pr_info("wxshadow: [teardown] %s: addr=%lx state=%d pending until step completes\n",
+                reason, page->page_addr, state);
+        return wxshadow_wait_for_teardown(page, reason);
+    }
 
     stepping = page->stepping_task;
-    page->stepping_task = NULL;
-
-    /* Resource pointers (shadow_page, orig_backup) are NOT freed here.
-     * They are freed in wxshadow_page_put when refcount reaches 0,
-     * ensuring no use-after-free by concurrent ref holders. */
-    page->pfn_shadow = 0;
-    page->pfn_orig_backup = 0;
-
     was_in_list = !list_empty(&page->list);
-    if (was_in_list)
-        list_del_init(&page->list);
     spin_unlock(&global_lock);
 
     pr_info("wxshadow: [teardown] %s: addr=%lx state=%d\n",
             reason, page->page_addr, state);
 
     /* --- Step 2: disable single-step with validation --- */
-    if (stepping && kfunc_user_disable_single_step) {
+    if (stepping && stepping != current && kfunc_user_disable_single_step) {
         u64 probe;
         if (is_kva((unsigned long)stepping) &&
             safe_read_u64((unsigned long)stepping, &probe)) {
@@ -402,7 +434,7 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     }
 
     /* --- Step 3: spin for concurrent step-handler (STEPPING race) --- */
-    if (state == WX_STATE_STEPPING) {
+    if (state == WX_STATE_STEPPING && stepping && stepping != current) {
         int w;
         for (w = 0; w < 50000; w++)
             cpu_relax();
@@ -412,23 +444,57 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     if (page->mm && page->pfn_original && kfunc_find_vma) {
         void *mm = page->mm;
         u64 probe;
-        if (is_kva((unsigned long)mm) &&
-            safe_read_u64((unsigned long)mm, &probe)) {
+        if (!is_kva((unsigned long)mm) ||
+            !safe_read_u64((unsigned long)mm, &probe)) {
+            pr_warn("wxshadow: [teardown] invalid mm %px for addr=%lx\n",
+                    mm, page->page_addr);
+            ret = -14;
+        } else {
             void *vma = kfunc_find_vma(mm, page->page_addr);
-            if (vma && vma_start(vma) <= page->page_addr) {
-                u64 prot = PTE_USER | PTE_RDONLY;  /* r-x */
-                if (wxshadow_switch_mapping(vma, page->page_addr,
-                                            page->pfn_original, prot) == 0) {
-                    wxshadow_flush_icache_page(page->page_addr);
+            if (!vma || vma_start(vma) > page->page_addr) {
+                pr_warn("wxshadow: [teardown] no vma for addr=%lx during %s\n",
+                        page->page_addr, reason);
+                ret = -14;
+            } else {
+                ret = wxshadow_page_restore_original_for_teardown_locked(
+                    page, vma, page->page_addr);
+                if (ret != 0) {
+                    pr_warn("wxshadow: [teardown] restore mapping failed for addr=%lx: %d\n",
+                            page->page_addr, ret);
                 }
             }
         }
+    } else if (page->pfn_original) {
+        pr_warn("wxshadow: [teardown] missing mm metadata for addr=%lx during %s\n",
+                page->page_addr, reason);
+        ret = -14;
     }
 
-    /* --- Step 5: release list's reference --- */
+    /* --- Step 5: mark dead, drop from list after mapping is restored --- */
+    spin_lock(&global_lock);
+    if (!page->dead) {
+        page->dead = true;
+        page->release_pending = false;
+        page->state = WX_STATE_NONE;
+        page->stepping_task = NULL;
+
+        /* Resource pointers (shadow_page, orig_backup) are NOT freed here.
+         * They are freed in wxshadow_page_put when refcount reaches 0,
+         * ensuring no use-after-free by concurrent ref holders. */
+        page->pfn_shadow = 0;
+        page->pfn_orig_backup = 0;
+
+        if (was_in_list && !list_empty(&page->list))
+            list_del_init(&page->list);
+    }
+    spin_unlock(&global_lock);
+
     /* Shadow/backup pages freed when last ref drops in page_put */
     if (was_in_list)
         wxshadow_page_put(page);
+
+    wxshadow_page_pte_unlock(page);
+    return ret;
 }
 
 /*
@@ -436,11 +502,13 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
  * If mm is NULL, teardown all pages (used during module unload).
  * Returns the number of pages cleaned up.
  */
-int wxshadow_teardown_pages_for_mm(void *mm, const char *reason)
+static int wxshadow_teardown_pages_for_mm_impl(void *mm, const char *reason,
+                                               bool strict)
 {
     struct list_head *pos;
     struct wxshadow_page *page;
     int count = 0;
+    int first_err = 0;
 
     while (1) {
         page = NULL;
@@ -459,14 +527,45 @@ int wxshadow_teardown_pages_for_mm(void *mm, const char *reason)
         if (!page)
             break;
 
-        wxshadow_teardown_page(page, reason);
+        {
+            int ret = wxshadow_teardown_page(page, reason);
+            if (ret < 0 && first_err == 0)
+                first_err = ret;
+            if (ret < 0) {
+                bool still_live;
+
+                spin_lock(&global_lock);
+                still_live = !page->dead;
+                spin_unlock(&global_lock);
+                wxshadow_page_put(page);
+                count++;
+
+                if (still_live)
+                    break;
+                continue;
+            }
+        }
         wxshadow_page_put(page);
         count++;
     }
 
     if (count > 0)
         pr_info("wxshadow: [%s] cleaned up %d pages\n", reason, count);
-    return count;
+    if (first_err < 0)
+        pr_warn("wxshadow: [%s] cleanup saw restore failures, first=%d\n",
+                reason, first_err);
+
+    return strict ? first_err : count;
+}
+
+int wxshadow_teardown_pages_for_mm(void *mm, const char *reason)
+{
+    return wxshadow_teardown_pages_for_mm_impl(mm, reason, false);
+}
+
+int wxshadow_release_pages_for_mm(void *mm, const char *reason)
+{
+    return wxshadow_teardown_pages_for_mm_impl(mm, reason, true);
 }
 
 int wxshadow_handle_write_fault(void *mm, unsigned long addr)

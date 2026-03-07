@@ -95,9 +95,16 @@ struct wxshadow_page {
      *   dead:     set to true when the page is removed from page_list.
      *             Handlers that obtained a ref before removal must check this
      *             flag and skip any PTE-switch-to-shadow operations.
+     *   release_pending:
+     *             set when user/module teardown arrives while a task is in the
+     *             STEPPING state.  The page stays in page_list so the step
+     *             handler can finalize the teardown after the original
+     *             instruction retires.
      */
     int  refcount;
     bool dead;
+    bool release_pending;
+    atomic_t pte_lock;            /* Serializes PTE rewrites for this page */
 
     /* Breakpoint info */
     struct wxshadow_bp bps[WXSHADOW_MAX_BPS_PER_PAGE];
