@@ -20,6 +20,7 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page_info;
     unsigned long page_addr = addr & PAGE_MASK;
+    unsigned long backup_pfn;
     void *vma;
     u64 prot;
     int ret;
@@ -30,19 +31,13 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
 
     spin_lock(&global_lock);
 
-    /* Only switch if currently on shadow with --x permission */
-    if (page_info->state != WX_STATE_SHADOW_X) {
+    if (page_info->dead || page_info->state != WX_STATE_SHADOW_X ||
+        !page_info->pfn_orig_backup) {
         spin_unlock(&global_lock);
         wxshadow_page_put(page_info);
         return -1;
     }
-
-    /* Must have original page reference */
-    if (!page_info->pfn_original) {
-        spin_unlock(&global_lock);
-        wxshadow_page_put(page_info);
-        return -1;
-    }
+    backup_pfn = page_info->pfn_orig_backup;
     spin_unlock(&global_lock);
 
     /* Get VMA for page switching (lockless) */
@@ -63,7 +58,7 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
     /* Switch to backup copy of original page with r-- permission (readable, no exec) */
     prot = PTE_USER | PTE_RDONLY | PTE_UXN;
 
-    ret = wxshadow_switch_mapping(vma, page_addr, page_info->pfn_orig_backup, prot);
+    ret = wxshadow_switch_mapping(vma, page_addr, backup_pfn, prot);
 
     if (ret == 0) {
         spin_lock(&global_lock);
@@ -85,6 +80,8 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page_info;
     unsigned long page_addr = addr & PAGE_MASK;
+    unsigned long shadow_pfn;
+    void *shadow_kaddr;
     void *vma;
     u64 prot;
     int ret;
@@ -95,27 +92,14 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
 
     spin_lock(&global_lock);
 
-    /* Must have shadow page */
-    if (!page_info->pfn_shadow) {
+    if (page_info->dead || page_info->state != WX_STATE_ORIGINAL ||
+        !page_info->pfn_shadow) {
         spin_unlock(&global_lock);
         wxshadow_page_put(page_info);
         return -1;
     }
-
-    /* If already on shadow or stepping, nothing to do */
-    if (page_info->state == WX_STATE_SHADOW_X ||
-        page_info->state == WX_STATE_STEPPING) {
-        spin_unlock(&global_lock);
-        wxshadow_page_put(page_info);
-        return -1;
-    }
-
-    /* Should be in ORIGINAL state after a read fault */
-    if (page_info->state != WX_STATE_ORIGINAL) {
-        spin_unlock(&global_lock);
-        wxshadow_page_put(page_info);
-        return -1;
-    }
+    shadow_pfn = page_info->pfn_shadow;
+    shadow_kaddr = page_info->shadow_page;
     spin_unlock(&global_lock);
 
     /* Get VMA for page switching (lockless) */
@@ -134,13 +118,13 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
     }
 
     /* Clean dcache at kernel VA so shadow data is visible at PoU */
-    if (page_info->shadow_page)
-        wxshadow_flush_kern_dcache_area((unsigned long)page_info->shadow_page, PAGE_SIZE);
+    if (shadow_kaddr)
+        wxshadow_flush_kern_dcache_area((unsigned long)shadow_kaddr, PAGE_SIZE);
 
     /* Switch to shadow page with --x permission (exec only, no read) */
     prot = 0;
 
-    ret = wxshadow_switch_mapping(vma, page_addr, page_info->pfn_shadow, prot);
+    ret = wxshadow_switch_mapping(vma, page_addr, shadow_pfn, prot);
 
     if (ret == 0) {
         wxshadow_flush_icache_page(page_addr);
@@ -311,6 +295,19 @@ static void follow_page_pte_after_impl(hook_fargs5_t *args, void *udata)
     orig_pte = (u64)args->arg6;
     ptep = (u64 *)args->arg7;
     vma = (void *)args->arg0;
+
+    /*
+     * If page was torn down during follow_page_pte, teardown already
+     * restored PTE to pfn_original and freed shadow/backup pages.
+     * Restoring orig_pte (shadow) would point PTE to freed memory.
+     */
+    spin_lock(&global_lock);
+    if (page->dead) {
+        spin_unlock(&global_lock);
+        wxshadow_page_put(page);
+        return;
+    }
+    spin_unlock(&global_lock);
 
     /* Restore shadow PTE */
     *(volatile u64 *)ptep = orig_pte;
@@ -598,6 +595,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
 {
     unsigned long pc = regs->pc;
     unsigned long page_addr = pc & PAGE_MASK;
+    unsigned long backup_pfn;
     void *mm = get_current_mm();
     void *vma;
     struct wxshadow_page *page_info = NULL;
@@ -655,22 +653,37 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
 
     prot = PTE_USER | PTE_RDONLY;
 
-    pr_info("wxshadow: BRK switching to orig_backup: backup_pfn=%lx shadow_pfn=%lx\n",
-            page_info->pfn_orig_backup, page_info->pfn_shadow);
+    /*
+     * Atomically re-check dead, capture backup PFN, and set STEPPING.
+     * Setting STEPPING here ensures teardown's step-3 spin protects
+     * the physical pages from being freed while we do switch_mapping.
+     */
+    spin_lock(&global_lock);
+    if (page_info->dead || !page_info->pfn_orig_backup) {
+        spin_unlock(&global_lock);
+        wxshadow_page_put(page_info);
+        kfunc_mmput(mm);
+        return DBG_HOOK_ERROR;
+    }
+    backup_pfn = page_info->pfn_orig_backup;
+    page_info->state = WX_STATE_STEPPING;
+    page_info->stepping_task = current;
+    spin_unlock(&global_lock);
 
-    if (wxshadow_switch_mapping(vma, page_addr, page_info->pfn_orig_backup, prot) != 0) {
-        wxshadow_page_put(page_info);  /* release caller ref */
+    pr_info("wxshadow: BRK switching to orig_backup: backup_pfn=%lx\n", backup_pfn);
+
+    if (wxshadow_switch_mapping(vma, page_addr, backup_pfn, prot) != 0) {
+        spin_lock(&global_lock);
+        page_info->state = WX_STATE_SHADOW_X;
+        page_info->stepping_task = NULL;
+        spin_unlock(&global_lock);
+        wxshadow_page_put(page_info);
         kfunc_mmput(mm);
         regs->pc += AARCH64_INSN_SIZE;
         return DBG_HOOK_HANDLED;
     }
 
     wxshadow_flush_icache_page(page_addr);
-
-    spin_lock(&global_lock);
-    page_info->state = WX_STATE_STEPPING;
-    page_info->stepping_task = current;
-    spin_unlock(&global_lock);
 
     wxshadow_page_put(page_info);  /* release caller ref */
     kfunc_mmput(mm);
@@ -768,6 +781,20 @@ static int wxshadow_step_handler_impl(struct pt_regs *regs, unsigned int esr)
     }
 
     prot = 0;
+
+    /* Re-check dead before PTE switch to prevent use-after-free.
+     * If teardown freed the shadow page between our lock release and here,
+     * skip the switch. */
+    spin_lock(&global_lock);
+    if (page_info->dead) {
+        page_info->stepping_task = NULL;
+        spin_unlock(&global_lock);
+        kfunc_user_disable_single_step(current);
+        wxshadow_page_put(page_info);
+        kfunc_mmput(mm);
+        return DBG_HOOK_HANDLED;
+    }
+    spin_unlock(&global_lock);
 
     wxshadow_switch_mapping(vma, page_addr, pfn_shadow, prot);
 

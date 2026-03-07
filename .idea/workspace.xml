@@ -49,16 +49,10 @@
   </component>
   <component name="ChangeListManager">
     <list default="true" id="12ffc765-530f-43b0-ab74-81a3d2476c80" name="更改" comment="hidemaps 隐藏指定段">
-      <change beforePath="$PROJECT_DIR$/.idea/editor.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/editor.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/mkpms.iml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/mkpms.iml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/.idea/vcs.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/vcs.xml" afterDir="false" />
       <change beforePath="$PROJECT_DIR$/.idea/workspace.xml" beforeDir="false" afterPath="$PROJECT_DIR$/.idea/workspace.xml" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/README.md" beforeDir="false" afterPath="$PROJECT_DIR$/README.md" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/anti-detect/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/anti-detect/CMakeLists.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/anti-detect/anti-detect.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/anti-detect/anti-detect.c" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/CMakeLists.txt" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/CMakeLists.txt" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_pgtable.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_pgtable.c" afterDir="false" />
-      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_scan.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_scan.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_bp.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_bp.c" afterDir="false" />
+      <change beforePath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_handlers.c" beforeDir="false" afterPath="$PROJECT_DIR$/kpms/wxshadow/wxshadow_handlers.c" afterDir="false" />
     </list>
     <option name="SHOW_DIALOG" value="false" />
     <option name="HIGHLIGHT_CONFLICTS" value="true" />
@@ -375,7 +369,7 @@
       <workItem from="1772076647700" duration="7889000" />
       <workItem from="1772417857089" duration="5732000" />
       <workItem from="1772707571131" duration="9518000" />
-      <workItem from="1772768063219" duration="8355000" />
+      <workItem from="1772768063219" duration="10868000" />
     </task>
     <task id="LOCAL-00001" summary="init">
       <option name="closed" value="true" />

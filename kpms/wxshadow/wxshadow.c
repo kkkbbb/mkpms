@@ -174,13 +174,30 @@ static struct wx_step_hook wxshadow_step_hook = {
 void wxshadow_page_put(struct wxshadow_page *page)
 {
     int should_free;
+    unsigned long shadow_vaddr = 0;
+    unsigned long backup_vaddr = 0;
 
     spin_lock(&global_lock);
     should_free = (--page->refcount == 0);
+    if (should_free) {
+        if (page->shadow_page) {
+            shadow_vaddr = (unsigned long)page->shadow_page;
+            page->shadow_page = NULL;
+        }
+        if (page->orig_backup) {
+            backup_vaddr = (unsigned long)page->orig_backup;
+            page->orig_backup = NULL;
+        }
+    }
     spin_unlock(&global_lock);
 
-    if (should_free)
+    if (should_free) {
+        if (shadow_vaddr)
+            kfunc_free_pages(shadow_vaddr, 0);
+        if (backup_vaddr)
+            kfunc_free_pages(backup_vaddr, 0);
         kfunc_kfree(page);
+    }
 }
 
 /* ========== Helper functions ========== */
@@ -224,7 +241,7 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
     page->mm = mm;
     page->page_addr = page_addr;
     page->state = WX_STATE_NONE;
-    page->refcount = 1;            /* list's reference */
+    page->refcount = 2;            /* list ref + caller ref */
     page->dead = false;
     INIT_LIST_HEAD(&page->list);
 
@@ -238,38 +255,22 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
 
 /*
  * Free a page structure and remove from list.
- * Must be called only when no external caller ref exists (refcount == 1,
- * i.e. only the list's ref).  Used in error paths after wxshadow_create_page.
+ * Marks the page dead and releases the list's reference.
+ * Caller must separately release its own ref via wxshadow_page_put().
+ * Shadow/backup pages are freed when the last ref drops.
  */
 void wxshadow_free_page(struct wxshadow_page *page)
 {
-    unsigned long shadow_vaddr = 0;
-    unsigned long backup_vaddr = 0;
-
     if (!page)
         return;
 
-    /* Capture shadow/backup pointers and mark dead under lock to prevent double-free
-     * races with exit_mmap_before or the exit loop. */
     spin_lock(&global_lock);
     page->dead = true;
     list_del_init(&page->list);
-    if (page->shadow_page) {
-        shadow_vaddr = (unsigned long)page->shadow_page;
-        page->shadow_page = NULL;
-    }
-    if (page->orig_backup) {
-        backup_vaddr = (unsigned long)page->orig_backup;
-        page->orig_backup = NULL;
-    }
     spin_unlock(&global_lock);
 
-    if (shadow_vaddr)
-        kfunc_free_pages(shadow_vaddr, 0);
-    if (backup_vaddr)
-        kfunc_free_pages(backup_vaddr, 0);
-
-    /* Release the list's ref (refcount was 1 → 0 → kfree). */
+    /* Release the list's ref.  When refcount reaches 0, page_put
+     * frees shadow_page, orig_backup, and the struct itself. */
     wxshadow_page_put(page);
 }
 
@@ -339,15 +340,17 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
  * wxshadow_teardown_page - unified page cleanup.
  *
  * Performs a complete, safe teardown of a shadow page:
- *   1. Under global_lock: mark dead, capture and NULL shadow_page/orig_backup/
- *      stepping_task, remove from page_list (if still present).
+ *   1. Under global_lock: mark dead, clear stepping_task, zero pfn_shadow/
+ *      pfn_orig_backup, remove from page_list (if still present).
  *   2. Disable single-step on the stepping task (with pointer validation).
  *   3. Brief spin for any concurrent step-handler that already passed the
  *      dead check (covers the STEPPING race window).
  *   4. Restore PTE to original page (if mm and VMA are still valid).
- *   5. Flush icache.
- *   6. Free shadow and backup page memory.
- *   7. Release the list's reference via wxshadow_page_put().
+ *   5. Release the list's reference via wxshadow_page_put().
+ *
+ * Shadow/backup page memory is NOT freed here — it is freed in
+ * wxshadow_page_put() when the last reference drops, preventing
+ * use-after-free by concurrent ref holders.
  *
  * Caller MUST hold a ref (from find_page / find_by_addr) and must call
  * wxshadow_page_put() after this function returns.
@@ -357,8 +360,6 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
  */
 void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
 {
-    unsigned long shadow_vaddr = 0;
-    unsigned long backup_vaddr = 0;
     void *stepping = NULL;
     int state;
     bool was_in_list;
@@ -366,7 +367,7 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     if (!page)
         return;
 
-    /* --- Step 1: mark dead, capture resources, remove from list --- */
+    /* --- Step 1: mark dead, remove from list --- */
     spin_lock(&global_lock);
     page->dead = true;
     state = page->state;
@@ -374,14 +375,11 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     stepping = page->stepping_task;
     page->stepping_task = NULL;
 
-    if (page->shadow_page) {
-        shadow_vaddr = (unsigned long)page->shadow_page;
-        page->shadow_page = NULL;
-    }
-    if (page->orig_backup) {
-        backup_vaddr = (unsigned long)page->orig_backup;
-        page->orig_backup = NULL;
-    }
+    /* Resource pointers (shadow_page, orig_backup) are NOT freed here.
+     * They are freed in wxshadow_page_put when refcount reaches 0,
+     * ensuring no use-after-free by concurrent ref holders. */
+    page->pfn_shadow = 0;
+    page->pfn_orig_backup = 0;
 
     was_in_list = !list_empty(&page->list);
     if (was_in_list)
@@ -427,13 +425,8 @@ void wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
         }
     }
 
-    /* --- Step 5: free shadow and backup page memory --- */
-    if (shadow_vaddr)
-        kfunc_free_pages(shadow_vaddr, 0);
-    if (backup_vaddr)
-        kfunc_free_pages(backup_vaddr, 0);
-
-    /* --- Step 6: release list's reference --- */
+    /* --- Step 5: release list's reference --- */
+    /* Shadow/backup pages freed when last ref drops in page_put */
     if (was_in_list)
         wxshadow_page_put(page);
 }
@@ -799,6 +792,7 @@ static long wxshadow_exit(void *__user reserved)
      */
     unhook_syscalln(__NR_prctl, prctl_before, NULL);
     pr_info("wxshadow: unhooked prctl (phase 1)\n");
+    wait_for_handlers_drain("phase1-prctl");
 
     /*
      * Phase 2: Iteratively pop and clean every page from page_list.
