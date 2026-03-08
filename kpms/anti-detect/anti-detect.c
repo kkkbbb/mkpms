@@ -18,12 +18,13 @@
 #include <kallsyms.h>
 #include <asm/current.h>
 #include <uapi/asm-generic/errno.h>
+#include "../common/kpm_demo_helpers.h"
 
-KPM_NAME("anti-detect");
-KPM_VERSION("1.2.0");
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("wwb");
-KPM_DESCRIPTION("Hide emulator files and KernelPatch presence from apps");
+KPM_MODULE_INFO("anti-detect",
+                "1.2.0",
+                "GPL v2",
+                "wwb",
+                "Hide emulator files and KernelPatch presence from apps");
 
 /* anti-detect-supercall.c */
 extern int supercall_guard_init(const char *superkey);

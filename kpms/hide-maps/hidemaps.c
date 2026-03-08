@@ -10,21 +10,10 @@
 #include <kputils.h>
 #include <linux/string.h>
 #include <hook.h>
+#include "../common/kpm_demo_helpers.h"
 
 ///< The name of the module, each KPM must has a unique name.
-KPM_NAME("kpm-hide-maps");
-
-///< The version of the module.
-KPM_VERSION("1.0.0");
-
-///< The license type.
-KPM_LICENSE("GPL v2");
-
-///< The author.
-KPM_AUTHOR("wwb");
-
-///< The description.
-KPM_DESCRIPTION("KernelPatch Module Example");
+KPM_MODULE_INFO("kpm-hide-maps", "1.0.0", "GPL v2", "wwb", "KernelPatch Module Example");
 
 
 typedef struct seq_file {
@@ -77,8 +66,8 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
  */
 static long hello_init(const char *args, const char *event, void *__user reserved)
 {
-    pr_info("kpm hello init, event: %s, args: %s\n", event, args);
-    pr_info("kernelpatch version: %x\n", kpver);
+    (void)reserved;
+    kpm_demo_log_init("kpm hello", event, args);
 
     vmalloc = (void *)kallsyms_lookup_name("vmalloc");
     vfree = (void *)kallsyms_lookup_name("vfree");
@@ -98,21 +87,16 @@ static long hello_init(const char *args, const char *event, void *__user reserve
 
 static long hello_control0(const char *args, char *__user out_msg, int outlen)
 {
-    pr_info("kpm hello control0, args: %s\n", args);
-    char echo[64] = "echo: ";
-    strncat(echo, args, 48);
-    compat_copy_to_user(out_msg, echo, sizeof(echo));
-
-    return 0;
+    return kpm_demo_echo_control("kpm hello", args, out_msg, outlen);
 }
 
 
 
 static long hello_exit(void *__user reserved)
 {
+    (void)reserved;
     unhook(show_map_vma);
-    pr_info("kpm hello exit\n");
-    return 0;
+    return kpm_demo_log_exit("kpm hello");
 }
 
 KPM_INIT(hello_init);

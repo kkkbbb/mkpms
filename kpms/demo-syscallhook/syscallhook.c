@@ -12,12 +12,13 @@
 #include <linux/string.h>
 #include <kputils.h>
 #include <asm/current.h>
+#include "../common/kpm_demo_helpers.h"
 
-KPM_NAME("kpm-syscall-hook-demo");
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("bmax121");
-KPM_DESCRIPTION("KernelPatch Module System Call Hook Example");
+KPM_MODULE_INFO("kpm-syscall-hook-demo",
+                "1.0.0",
+                "GPL v2",
+                "bmax121",
+                "KernelPatch Module System Call Hook Example");
 
 const char *margs = 0;
 enum hook_type hook_type = NONE;
@@ -111,8 +112,7 @@ out:
 
 static long syscall_hook_control0(const char *args, char *__user out_msg, int outlen)
 {
-    pr_info("syscall_hook control, args: %s\n", args);
-    return 0;
+    return kpm_demo_log_control("kpm-syscall-hook-demo", args, out_msg, outlen);
 }
 
 static long syscall_hook_demo_exit(void *__user reserved)

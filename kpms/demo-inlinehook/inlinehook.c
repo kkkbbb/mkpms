@@ -8,12 +8,13 @@
 #include <kpmodule.h>
 #include <hook.h>
 #include <linux/printk.h>
+#include "../common/kpm_demo_helpers.h"
 
-KPM_NAME("kpm-inline-hook-demo");
-KPM_VERSION("1.0.0");
-KPM_LICENSE("GPL v2");
-KPM_AUTHOR("bmax121");
-KPM_DESCRIPTION("KernelPatch Module Inline Hook Example");
+KPM_MODULE_INFO("kpm-inline-hook-demo",
+                "1.0.0",
+                "GPL v2",
+                "bmax121",
+                "KernelPatch Module Inline Hook Example");
 
 int __noinline add(int a, int b)
 {
@@ -54,8 +55,7 @@ static long inline_hook_demo_init(const char *args, const char *event, void *__u
 
 static long inline_hook_control0(const char *args, char *__user out_msg, int outlen)
 {
-    pr_info("kpm control, args: %s\n", args);
-    return 0;
+    return kpm_demo_log_control("kpm inline-hook-demo", args, out_msg, outlen);
 }
 
 static long inline_hook_demo_exit(void *__user reserved)
