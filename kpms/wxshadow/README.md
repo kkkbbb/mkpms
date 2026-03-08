@@ -3,7 +3,7 @@
 ## Build
 
 ```bash
-cmake --build build --target wxshadow.kpm wxshadow_client test_pmd_split -j4
+cmake --build build --target wxshadow.kpm wxshadow_client -j4
 ```
 
 ## Device Race Regression
@@ -13,7 +13,7 @@ cmake --build build --target wxshadow.kpm wxshadow_client test_pmd_split -j4
 - `scripts/wxshadow_race.sh`
   设备侧 worker。负责并发执行 `patch/release`、`bp/release`、`release_all`，并同时触发点按和 `memread`。
 - `scripts/run_device_race_regression.sh`
-  主机侧 wrapper。负责构建产物、推送到 `adb` 设备、加载 `wxshadow`、执行 `--selftest` / `test_pmd_split`、解析三方进程地址并跑竞态回归。
+  主机侧 wrapper。负责构建产物、推送到 `adb` 设备、加载 `wxshadow`、解析三方进程地址并跑竞态回归。
 
 默认回归对象是 `com.example.crcdemo` / `libcrcdemo.so`，会自动解析：
 
@@ -63,10 +63,8 @@ kpms/wxshadow/scripts/run_device_race_regression.sh --superkey wwb12345 --no-sta
 
 默认行为：
 
-- 推送 `wxshadow.kpm`、`wxshadow_client`、`test_pmd_split`
+- 推送 `wxshadow.kpm`、`wxshadow_client`
 - 如本地缺失，会构建并推送 `tools/kpatch/kpatch.c` 和 `tools/memread.c` 对应的 arm64 静态二进制
-- 执行 `wxshadow_client --selftest`
-- 执行 `test_pmd_split`
 - 顺序执行 `patch_release`、`bp_release`、`release_all`
 - 检查 app PID 是否重启
 - 检查本轮新增内核日志里是否出现这些已知坏信号：

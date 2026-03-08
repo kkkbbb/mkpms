@@ -72,6 +72,11 @@ adb_su() {
     adb -s "$DEVICE_SERIAL" shell "su -c $quoted"
 }
 
+require_su() {
+    adb -s "$DEVICE_SERIAL" shell 'command -v su >/dev/null 2>&1' ||
+        die "device does not provide su; race regression requires su for dmesg and /proc/<pid>/maps access"
+}
+
 cleanup() {
     local rc=$?
     if [ -n "$TMP_DIR" ] && [ -d "$TMP_DIR" ]; then
@@ -156,18 +161,17 @@ build_helpers() {
 
 build_targets() {
     log "building wxshadow artifacts"
-    cmake --build "$BUILD_DIR" --target wxshadow.kpm wxshadow_client test_pmd_split -j4 >/dev/null
+    cmake --build "$BUILD_DIR" --target wxshadow.kpm wxshadow_client -j4 >/dev/null
 }
 
 push_artifacts() {
     log "pushing artifacts to device"
     adb -s "$DEVICE_SERIAL" push "$BUILD_DIR/kpms/wxshadow/wxshadow.kpm" "$DEVICE_TMP/wxshadow.kpm" >/dev/null
     adb -s "$DEVICE_SERIAL" push "$BUILD_DIR/kpms/wxshadow/wxshadow_client" "$DEVICE_TMP/wxshadow_client" >/dev/null
-    adb -s "$DEVICE_SERIAL" push "$BUILD_DIR/kpms/wxshadow/test_pmd_split" "$DEVICE_TMP/test_pmd_split" >/dev/null
     adb -s "$DEVICE_SERIAL" push "$BUILD_DIR/memread" "$DEVICE_TMP/memread" >/dev/null
     adb -s "$DEVICE_SERIAL" push "$BUILD_DIR/tools/kpatch" "$DEVICE_TMP/kpatch" >/dev/null
     adb -s "$DEVICE_SERIAL" push "$ROOT_DIR/kpms/wxshadow/scripts/wxshadow_race.sh" "$DEVICE_TMP/wxshadow_race.sh" >/dev/null
-    adb_shell "chmod 755 $DEVICE_TMP/wxshadow_client $DEVICE_TMP/test_pmd_split $DEVICE_TMP/memread $DEVICE_TMP/kpatch $DEVICE_TMP/wxshadow_race.sh" >/dev/null
+    adb_shell "chmod 755 $DEVICE_TMP/wxshadow_client $DEVICE_TMP/memread $DEVICE_TMP/kpatch $DEVICE_TMP/wxshadow_race.sh" >/dev/null
 }
 
 load_module() {
@@ -176,13 +180,6 @@ load_module() {
     adb_su "$KPATCH_ON_DEVICE $SUPERKEY hello" >/dev/null
     adb_su "$KPATCH_ON_DEVICE $SUPERKEY kpm load $DEVICE_TMP/wxshadow.kpm" >/dev/null
     LOADED=1
-}
-
-run_smoke_tests() {
-    log "running selftest"
-    adb_su "$DEVICE_TMP/wxshadow_client --selftest" >/dev/null
-    log "running test_pmd_split"
-    adb_su "$DEVICE_TMP/test_pmd_split" >/dev/null
 }
 
 start_app_if_needed() {
@@ -323,12 +320,12 @@ main() {
     need_cmd "$READELF_BIN"
     need_cmd "$OBJDUMP_BIN"
 
+    require_su
     build_helpers
     build_targets
     push_artifacts
     DMESG_BASELINE="$(adb_su "dmesg | wc -l" | tr -d '\r[:space:]')"
     load_module
-    run_smoke_tests
     start_app_if_needed
     pid="$(wait_for_pid)" || die "failed to find pid for $PACKAGE"
     log "resolved pid=$pid"

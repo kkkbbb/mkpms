@@ -119,6 +119,7 @@ static int create_shadow_page_common(void *mm, unsigned long page_addr,
 
     orig_pfn = (*pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
     page_info->pfn_original = orig_pfn;
+    page_info->pte_original = *pte;
     *out_orig_kaddr = pfn_to_kaddr(orig_pfn);
     if (!is_kva((unsigned long)*out_orig_kaddr)) {
         pr_err("wxshadow: [%s] invalid orig_kaddr %px for pfn %lx\n",
@@ -134,17 +135,6 @@ static int create_shadow_page_common(void *mm, unsigned long page_addr,
 
     page_info->pfn_shadow = kaddr_to_pfn(shadow_vaddr);
     page_info->shadow_page = (void *)shadow_vaddr;
-
-    {
-        unsigned long backup_vaddr = kfunc___get_free_pages(0xcc0, 0);
-        if (!backup_vaddr) {
-            pr_err("wxshadow: [%s] failed to allocate orig_backup page\n", op);
-            goto err_nomem;
-        }
-        memcpy((void *)backup_vaddr, *out_orig_kaddr, PAGE_SIZE);
-        page_info->orig_backup = (void *)backup_vaddr;
-        page_info->pfn_orig_backup = kaddr_to_pfn(backup_vaddr);
-    }
 
     *out_page_info = page_info;
     return 0;
@@ -163,26 +153,105 @@ err_nomem:
 static int prepare_existing_shadow_page(struct wxshadow_page *page_info,
                                         unsigned long page_addr,
                                         const char *op,
-                                        bool *out_needs_activation)
+                                        bool *out_needs_activation,
+                                        bool *out_needs_refresh)
 {
-    bool busy;
-    bool needs_activation;
+    int i;
 
-    spin_lock(&global_lock);
-    busy = page_info->release_pending ||
-           page_info->state == WX_STATE_STEPPING;
-    needs_activation = !page_info->dead &&
-                       page_info->state != WX_STATE_SHADOW_X;
-    spin_unlock(&global_lock);
+    for (i = 0; i < WXSHADOW_RELEASE_WAIT_LOOPS; i++) {
+        bool busy;
+        bool dead;
+        bool needs_activation;
+        bool needs_refresh;
 
-    if (busy) {
-        pr_err("wxshadow: [%s] page %lx busy with in-flight step/release\n",
-               op, page_addr);
-        return -16;  /* EBUSY */
+        spin_lock(&global_lock);
+        dead = page_info->dead;
+        busy = page_info->release_pending ||
+               page_info->logical_release_pending ||
+               page_info->brk_in_flight > 0 ||
+               page_info->state == WX_STATE_STEPPING;
+        needs_activation = !dead &&
+                           page_info->state != WX_STATE_SHADOW_X;
+        needs_refresh = !dead &&
+                        page_info->state == WX_STATE_DORMANT;
+        spin_unlock(&global_lock);
+
+        if (dead)
+            return 1;
+
+        if (!busy) {
+            if (out_needs_activation)
+                *out_needs_activation = needs_activation;
+            if (out_needs_refresh)
+                *out_needs_refresh = needs_refresh;
+            return 0;
+        }
+
+        cpu_relax();
     }
 
-    if (out_needs_activation)
-        *out_needs_activation = needs_activation;
+    pr_err("wxshadow: [%s] page %lx busy with in-flight step/release\n",
+           op, page_addr);
+    return -16;  /* EBUSY */
+}
+
+static int refresh_dormant_shadow_page(struct wxshadow_page *page_info,
+                                       void *mm, unsigned long page_addr,
+                                       const char *op)
+{
+    u64 *pte;
+    unsigned long orig_pfn;
+    unsigned long shadow_vaddr;
+    void *orig_kaddr;
+
+    if (!page_info || !mm)
+        return -22;
+
+    wxshadow_page_pte_lock(page_info);
+
+    spin_lock(&global_lock);
+    if (page_info->dead || page_info->release_pending ||
+        page_info->logical_release_pending ||
+        page_info->state != WX_STATE_DORMANT ||
+        !page_info->shadow_page) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page_info);
+        return 0;
+    }
+    shadow_vaddr = (unsigned long)page_info->shadow_page;
+    spin_unlock(&global_lock);
+
+    pte = get_user_pte(mm, page_addr, NULL);
+    if (!pte || !(*pte & PTE_VALID)) {
+        pr_err("wxshadow: [%s] no pte while refreshing dormant page %lx\n",
+               op, page_addr);
+        wxshadow_page_pte_unlock(page_info);
+        return -14;
+    }
+
+    orig_pfn = (*pte >> PAGE_SHIFT) & 0xFFFFFFFFFUL;
+    orig_kaddr = pfn_to_kaddr(orig_pfn);
+    if (!is_kva((unsigned long)orig_kaddr)) {
+        pr_err("wxshadow: [%s] invalid orig_kaddr %px for dormant page %lx pfn %lx\n",
+               op, orig_kaddr, page_addr, orig_pfn);
+        wxshadow_page_pte_unlock(page_info);
+        return -14;
+    }
+
+    memcpy((void *)shadow_vaddr, orig_kaddr, PAGE_SIZE);
+    wxshadow_flush_kern_dcache_area(shadow_vaddr, PAGE_SIZE);
+
+    spin_lock(&global_lock);
+    if (!page_info->dead && page_info->state == WX_STATE_DORMANT) {
+        page_info->pfn_original = orig_pfn;
+        page_info->pte_original = *pte;
+    }
+    spin_unlock(&global_lock);
+
+    wxshadow_page_pte_unlock(page_info);
+
+    pr_info("wxshadow: [%s] refreshed dormant page %lx to pfn %lx\n",
+            op, page_addr, orig_pfn);
     return 0;
 }
 
@@ -196,6 +265,7 @@ static int acquire_shadow_page_for_write(void *mm, unsigned long addr,
                                          bool *out_needs_activation)
 {
     struct wxshadow_page *page_info;
+    bool needs_refresh = false;
     int ret;
 
     *out_page_info = NULL;
@@ -208,13 +278,29 @@ static int acquire_shadow_page_for_write(void *mm, unsigned long addr,
     if (ret < 0)
         return ret;
 
-    page_info = find_usable_shadow_page(mm, page_addr);
-    if (page_info) {
+    for (;;) {
+        page_info = find_usable_shadow_page(mm, page_addr);
+        if (!page_info)
+            break;
+
         ret = prepare_existing_shadow_page(page_info, page_addr, op,
-                                           out_needs_activation);
+                                           out_needs_activation,
+                                           &needs_refresh);
+        if (ret > 0) {
+            wxshadow_page_put(page_info);
+            continue;
+        }
         if (ret < 0) {
             wxshadow_page_put(page_info);
             return ret;
+        }
+
+        if (needs_refresh) {
+            ret = refresh_dormant_shadow_page(page_info, mm, page_addr, op);
+            if (ret < 0) {
+                wxshadow_page_put(page_info);
+                return ret;
+            }
         }
 
         *out_page_info = page_info;
@@ -247,26 +333,115 @@ static int activate_shadow_page(void *vma, unsigned long page_addr,
     return wxshadow_page_activate_shadow(page_info, vma, page_addr);
 }
 
+struct wxshadow_write_ctx {
+    const char *op;
+    void *vma;
+    struct wxshadow_page *page_info;
+    void *orig_kaddr;
+    unsigned long page_addr;
+    bool is_new;
+    bool needs_activation;
+};
+
+static int wxshadow_acquire_write_ctx(void *mm, unsigned long addr,
+                                      const char *op,
+                                      struct wxshadow_write_ctx *ctx)
+{
+    int ret;
+
+    if (!ctx)
+        return -22;
+
+    memset(ctx, 0, sizeof(*ctx));
+    ctx->op = op;
+    ctx->page_addr = addr & PAGE_MASK;
+
+    ret = require_tlb_flush_capability(op);
+    if (ret < 0)
+        return ret;
+
+    return acquire_shadow_page_for_write(mm, addr, ctx->page_addr, op,
+                                         &ctx->vma, &ctx->page_info,
+                                         &ctx->orig_kaddr, &ctx->is_new,
+                                         &ctx->needs_activation);
+}
+
+static void wxshadow_put_write_ctx(struct wxshadow_write_ctx *ctx)
+{
+    if (!ctx || !ctx->page_info)
+        return;
+
+    wxshadow_page_put(ctx->page_info);
+    ctx->page_info = NULL;
+}
+
+static void wxshadow_abort_write_ctx(struct wxshadow_write_ctx *ctx)
+{
+    if (!ctx || !ctx->page_info)
+        return;
+
+    if (ctx->is_new)
+        destroy_unactivated_shadow_page(ctx->page_info);
+    else
+        wxshadow_page_put(ctx->page_info);
+    ctx->page_info = NULL;
+}
+
+static int wxshadow_activate_write_ctx(struct wxshadow_write_ctx *ctx,
+                                       bool force_activation)
+{
+    if (!ctx || !ctx->page_info)
+        return -22;
+
+    if (!force_activation && !ctx->needs_activation)
+        return 0;
+
+    return activate_shadow_page(ctx->vma, ctx->page_addr, ctx->page_info);
+}
+
+static u64 next_mod_serial_locked(struct wxshadow_page *page_info)
+{
+    page_info->next_mod_serial++;
+    if (page_info->next_mod_serial == 0)
+        page_info->next_mod_serial++;
+    return page_info->next_mod_serial;
+}
+
 static int ensure_bp_slot(struct wxshadow_page *page_info, unsigned long addr)
 {
     int i;
+    int free_idx = -1;
 
+    spin_lock(&global_lock);
     for (i = 0; i < page_info->nr_bps; i++) {
-        if (page_info->bps[i].addr != addr)
-            continue;
-
-        page_info->bps[i].active = true;
-        return i;
+        if (page_info->bps[i].addr == addr) {
+            if (!page_info->bps[i].active) {
+                memset(&page_info->bps[i], 0, sizeof(page_info->bps[i]));
+                page_info->bps[i].addr = addr;
+            }
+            page_info->bps[i].active = true;
+            page_info->bps[i].serial = next_mod_serial_locked(page_info);
+            spin_unlock(&global_lock);
+            return i;
+        }
+        if (free_idx < 0 && !page_info->bps[i].active)
+            free_idx = i;
     }
 
-    if (page_info->nr_bps >= WXSHADOW_MAX_BPS_PER_PAGE)
-        return -28;  /* ENOSPC */
+    if (free_idx < 0) {
+        if (page_info->nr_bps >= WXSHADOW_MAX_BPS_PER_PAGE) {
+            spin_unlock(&global_lock);
+            return -28;  /* ENOSPC */
+        }
+        free_idx = page_info->nr_bps++;
+    }
 
-    i = page_info->nr_bps++;
-    memset(&page_info->bps[i], 0, sizeof(page_info->bps[i]));
-    page_info->bps[i].addr = addr;
-    page_info->bps[i].active = true;
-    return i;
+    memset(&page_info->bps[free_idx], 0, sizeof(page_info->bps[free_idx]));
+    page_info->bps[free_idx].addr = addr;
+    page_info->bps[free_idx].active = true;
+    page_info->bps[free_idx].serial = next_mod_serial_locked(page_info);
+    spin_unlock(&global_lock);
+    return free_idx;
 }
 
 enum wxshadow_shadow_flush_mode {
@@ -282,6 +457,14 @@ static int copy_original_page_to_shadow(struct wxshadow_page *page_info,
 
     memcpy(page_info->shadow_page, orig_kaddr, PAGE_SIZE);
     return 0;
+}
+
+static int wxshadow_prepare_new_write_ctx(struct wxshadow_write_ctx *ctx)
+{
+    if (!ctx || !ctx->page_info || !ctx->is_new)
+        return -22;
+
+    return copy_original_page_to_shadow(ctx->page_info, ctx->orig_kaddr);
 }
 
 static int write_shadow_bytes(struct wxshadow_page *page_info,
@@ -321,78 +504,522 @@ static int write_shadow_u32(struct wxshadow_page *page_info,
                               sizeof(value), flush_mode, flush_icache);
 }
 
+static int upsert_patch_record(struct wxshadow_page *page_info,
+                               unsigned long offset, unsigned long len,
+                               void *patch_data, void **out_old_data,
+                               unsigned long *out_rebuild_len)
+{
+    int i;
+    int free_idx = -1;
+    int idx = -1;
+    unsigned long rebuild_len = len;
+    void *old_data = NULL;
+
+    spin_lock(&global_lock);
+    for (i = 0; i < page_info->nr_patches; i++) {
+        if (page_info->patches[i].active &&
+            page_info->patches[i].offset == offset) {
+            idx = i;
+            old_data = page_info->patches[i].data;
+            if (page_info->patches[i].len > rebuild_len)
+                rebuild_len = page_info->patches[i].len;
+            break;
+        }
+        if (free_idx < 0 && !page_info->patches[i].active &&
+            !page_info->patches[i].data) {
+            free_idx = i;
+        }
+    }
+
+    if (idx < 0) {
+        if (free_idx < 0) {
+            if (page_info->nr_patches >= WXSHADOW_MAX_PATCHES_PER_PAGE) {
+                spin_unlock(&global_lock);
+                return -28;  /* ENOSPC */
+            }
+            free_idx = page_info->nr_patches++;
+        }
+        idx = free_idx;
+        memset(&page_info->patches[idx], 0, sizeof(page_info->patches[idx]));
+    }
+
+    page_info->patches[idx].offset = (u16)offset;
+    page_info->patches[idx].len = (u16)len;
+    page_info->patches[idx].active = true;
+    page_info->patches[idx].data = patch_data;
+    page_info->patches[idx].serial = next_mod_serial_locked(page_info);
+    spin_unlock(&global_lock);
+
+    if (out_old_data)
+        *out_old_data = old_data;
+    if (out_rebuild_len)
+        *out_rebuild_len = rebuild_len;
+
+    wxshadow_sync_page_tracking(page_info);
+    return 0;
+}
+
+struct shadow_apply_op {
+    u64 serial;
+    unsigned long offset;
+    unsigned long len;
+    const void *data;
+    bool is_bp;
+};
+
+static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
+                                         unsigned long offset,
+                                         unsigned long len)
+{
+    struct shadow_apply_op ops[WXSHADOW_MAX_ACTIVE_MODS_PER_PAGE];
+    unsigned long original_pfn;
+    unsigned long shadow_vaddr;
+    unsigned long page_addr;
+    unsigned long range_end;
+    const char *original_kaddr;
+    int nr_ops = 0;
+    int i;
+    int j;
+
+    if (!page_info)
+        return -22;
+    if (len == 0)
+        return 0;
+    if (offset >= PAGE_SIZE || offset + len > PAGE_SIZE)
+        return -22;
+
+    spin_lock(&global_lock);
+    if (!page_info->shadow_page || !page_info->pfn_original) {
+        spin_unlock(&global_lock);
+        return -14;
+    }
+
+    original_pfn = page_info->pfn_original;
+    shadow_vaddr = (unsigned long)page_info->shadow_page;
+    page_addr = page_info->page_addr;
+    range_end = offset + len;
+
+    for (i = 0; i < page_info->nr_patches; i++) {
+        struct wxshadow_patch *patch = &page_info->patches[i];
+        unsigned long patch_end;
+
+        if (!patch->active || !patch->data || patch->len == 0)
+            continue;
+
+        patch_end = patch->offset + patch->len;
+        if (patch->offset >= range_end || patch_end <= offset)
+            continue;
+
+        ops[nr_ops].serial = patch->serial;
+        ops[nr_ops].offset = patch->offset;
+        ops[nr_ops].len = patch->len;
+        ops[nr_ops].data = patch->data;
+        ops[nr_ops].is_bp = false;
+        nr_ops++;
+    }
+
+    for (i = 0; i < page_info->nr_bps; i++) {
+        struct wxshadow_bp *bp = &page_info->bps[i];
+        unsigned long bp_offset;
+        unsigned long bp_end;
+
+        if (!bp->active)
+            continue;
+
+        bp_offset = bp->addr & ~PAGE_MASK;
+        bp_end = bp_offset + AARCH64_INSN_SIZE;
+        if (bp_offset >= range_end || bp_end <= offset)
+            continue;
+
+        ops[nr_ops].serial = bp->serial;
+        ops[nr_ops].offset = bp_offset;
+        ops[nr_ops].len = AARCH64_INSN_SIZE;
+        ops[nr_ops].data = NULL;
+        ops[nr_ops].is_bp = true;
+        nr_ops++;
+    }
+    spin_unlock(&global_lock);
+
+    original_kaddr = (const char *)pfn_to_kaddr(original_pfn);
+    if (!is_kva((unsigned long)original_kaddr))
+        return -14;
+
+    memcpy((void *)(shadow_vaddr + offset),
+           original_kaddr + offset, len);
+
+    for (i = 1; i < nr_ops; i++) {
+        struct shadow_apply_op op = ops[i];
+
+        for (j = i - 1; j >= 0 && ops[j].serial > op.serial; j--)
+            ops[j + 1] = ops[j];
+        ops[j + 1] = op;
+    }
+
+    for (i = 0; i < nr_ops; i++) {
+        unsigned long apply_start = ops[i].offset;
+        unsigned long apply_end = ops[i].offset + ops[i].len;
+        const char *src;
+        u32 brk_insn = WXSHADOW_BRK_INSN;
+
+        if (apply_start < offset)
+            apply_start = offset;
+        if (apply_end > range_end)
+            apply_end = range_end;
+        if (apply_start >= apply_end)
+            continue;
+
+        if (ops[i].is_bp) {
+            src = (const char *)&brk_insn;
+        } else {
+            src = (const char *)ops[i].data;
+        }
+
+        memcpy((void *)(shadow_vaddr + apply_start),
+               src + (apply_start - ops[i].offset),
+               apply_end - apply_start);
+    }
+
+    wxshadow_flush_kern_dcache_area(shadow_vaddr + offset, len);
+    wxshadow_flush_icache_page(page_addr);
+    return 0;
+}
+
+static bool wxshadow_page_has_active_mods_locked(struct wxshadow_page *page_info)
+{
+    int i;
+
+    for (i = 0; i < page_info->nr_bps; i++) {
+        if (page_info->bps[i].active)
+            return true;
+    }
+    for (i = 0; i < page_info->nr_patches; i++) {
+        if (page_info->patches[i].active)
+            return true;
+    }
+    return false;
+}
+
+static void wxshadow_clear_logical_release_pending_locked(
+    struct wxshadow_page *page_info)
+{
+    if (page_info && !page_info->dead)
+        page_info->logical_release_pending = false;
+}
+
+static void wxshadow_clear_logical_release_pending(struct wxshadow_page *page_info)
+{
+    spin_lock(&global_lock);
+    wxshadow_clear_logical_release_pending_locked(page_info);
+    spin_unlock(&global_lock);
+}
+
+#define WXSHADOW_RELEASE_MATCH_BP    (1U << 0)
+#define WXSHADOW_RELEASE_MATCH_PATCH (1U << 1)
+
+static int wxshadow_wait_for_release_brk_handlers(struct wxshadow_page *page_info,
+                                                  const char *reason)
+{
+    int i;
+
+    if (!page_info)
+        return -22;
+
+    for (i = 0; i < WXSHADOW_RELEASE_WAIT_LOOPS; i++) {
+        bool done;
+
+        spin_lock(&global_lock);
+        done = page_info->dead || page_info->brk_in_flight == 0;
+        spin_unlock(&global_lock);
+
+        if (done)
+            return 0;
+
+        cpu_relax();
+    }
+
+    pr_warn("wxshadow: [%s] timeout waiting for in-flight BRK handlers at addr=%lx\n",
+            reason, page_info->page_addr);
+    return -16;
+}
+
+static int wxshadow_find_release_vma(struct wxshadow_page *page_info,
+                                     const char *reason,
+                                     void **out_vma)
+{
+    void *mm;
+    void *vma;
+    u64 probe;
+
+    if (!page_info || !out_vma)
+        return -22;
+
+    mm = page_info->mm;
+    if (!mm || !page_info->pfn_original || !kfunc_find_vma)
+        return -14;
+
+    if (!is_kva((unsigned long)mm) ||
+        !safe_read_u64((unsigned long)mm, &probe))
+        return -14;
+
+    vma = kfunc_find_vma(mm, page_info->page_addr);
+    if (!vma || vma_start(vma) > page_info->page_addr) {
+        pr_warn("wxshadow: [%s] no vma for addr=%lx\n",
+                reason, page_info->page_addr);
+        return -14;
+    }
+
+    *out_vma = vma;
+    return 0;
+}
+
+static int wxshadow_release_mod_at_addr(struct wxshadow_page *page_info,
+                                        unsigned long addr,
+                                        unsigned int match_flags,
+                                        const char *reason)
+{
+    void *free_patch_data[WXSHADOW_MAX_PATCHES_PER_PAGE];
+    enum wxshadow_state initial_state = WX_STATE_NONE;
+    unsigned long offset = addr & ~PAGE_MASK;
+    unsigned long range_start = PAGE_SIZE;
+    unsigned long range_end = 0;
+    bool wait_brk_handlers = false;
+    bool matched = false;
+    bool has_remaining;
+    bool should_reactivate = false;
+    void *vma = NULL;
+    int nr_free = 0;
+    int ret = 0;
+    int i;
+
+    if (!page_info)
+        return -22;
+
+retry:
+    wxshadow_page_pte_lock(page_info);
+
+    spin_lock(&global_lock);
+    if (page_info->dead || !page_info->shadow_page) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page_info);
+        return -ENODATA;
+    }
+    wait_brk_handlers = page_info->brk_in_flight > 0;
+    if (page_info->release_pending || page_info->state == WX_STATE_STEPPING ||
+        wait_brk_handlers || page_info->logical_release_pending) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page_info);
+        if (wait_brk_handlers) {
+            ret = wxshadow_wait_for_release_brk_handlers(page_info, reason);
+            if (ret < 0)
+                return ret;
+        } else {
+            cpu_relax();
+        }
+        goto retry;
+    }
+    initial_state = page_info->state;
+    page_info->logical_release_pending = true;
+    spin_unlock(&global_lock);
+
+    if (initial_state != WX_STATE_DORMANT && initial_state != WX_STATE_NONE) {
+        ret = wxshadow_find_release_vma(page_info, reason, &vma);
+        if (ret < 0)
+            goto out_fail_locked;
+
+        ret = wxshadow_page_enter_dormant_locked(page_info, vma,
+                                                 page_info->page_addr);
+        if (ret < 0)
+            goto out_fail_locked;
+    }
+
+    wxshadow_page_pte_unlock(page_info);
+
+    wxshadow_sync_shadow_exec_zero(page_info, reason);
+
+    ret = wxshadow_wait_for_release_brk_handlers(page_info, reason);
+    if (ret < 0)
+        goto out_fail_unlocked;
+
+    wxshadow_page_pte_lock(page_info);
+
+    spin_lock(&global_lock);
+    if (page_info->dead || !page_info->shadow_page) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page_info);
+        return -ENODATA;
+    }
+    if (page_info->release_pending || page_info->state == WX_STATE_STEPPING ||
+        page_info->brk_in_flight > 0) {
+        wxshadow_clear_logical_release_pending_locked(page_info);
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page_info);
+        cpu_relax();
+        goto retry;
+    }
+
+    if (match_flags & WXSHADOW_RELEASE_MATCH_BP) {
+        for (i = 0; i < page_info->nr_bps; i++) {
+            struct wxshadow_bp *bp = &page_info->bps[i];
+
+            if (!bp->active || bp->addr != addr)
+                continue;
+
+            bp->active = false;
+            bp->serial = 0;
+            memset(bp->reg_mods, 0, sizeof(bp->reg_mods));
+            bp->nr_reg_mods = 0;
+            if (range_start > offset)
+                range_start = offset;
+            if (range_end < offset + AARCH64_INSN_SIZE)
+                range_end = offset + AARCH64_INSN_SIZE;
+            matched = true;
+        }
+    }
+
+    if (match_flags & WXSHADOW_RELEASE_MATCH_PATCH) {
+        for (i = 0; i < page_info->nr_patches; i++) {
+            struct wxshadow_patch *patch = &page_info->patches[i];
+
+            if (!patch->active || patch->offset != offset)
+                continue;
+
+            if (patch->data)
+                free_patch_data[nr_free++] = patch->data;
+            if (range_start > patch->offset)
+                range_start = patch->offset;
+            if (range_end < patch->offset + patch->len)
+                range_end = patch->offset + patch->len;
+            patch->active = false;
+            patch->serial = 0;
+            patch->len = 0;
+            patch->data = NULL;
+            matched = true;
+        }
+    }
+
+    has_remaining = wxshadow_page_has_active_mods_locked(page_info);
+    should_reactivate = has_remaining &&
+                        initial_state != WX_STATE_DORMANT &&
+                        initial_state != WX_STATE_NONE;
+    spin_unlock(&global_lock);
+
+    if (!matched) {
+        pr_err("wxshadow: [release] no matching modification at addr=%lx (page=%lx offset=%lx)\n",
+               addr, page_info->page_addr, offset);
+        wxshadow_clear_logical_release_pending(page_info);
+        wxshadow_page_pte_unlock(page_info);
+        return -ENODATA;
+    }
+
+    wxshadow_sync_page_tracking(page_info);
+
+    if (has_remaining) {
+        ret = wxshadow_rebuild_shadow_range(page_info, range_start,
+                                            range_end - range_start);
+        if (ret == 0 && should_reactivate) {
+            ret = wxshadow_find_release_vma(page_info, reason, &vma);
+            if (ret == 0) {
+                wxshadow_clear_logical_release_pending(page_info);
+                ret = wxshadow_page_activate_shadow_locked(page_info, vma,
+                                                           page_info->page_addr);
+            }
+        } else {
+            wxshadow_clear_logical_release_pending(page_info);
+        }
+    } else {
+        wxshadow_clear_logical_release_pending(page_info);
+    }
+
+    wxshadow_page_pte_unlock(page_info);
+
+    for (i = 0; i < nr_free; i++)
+        kfunc_kfree(free_patch_data[i]);
+
+    if (ret < 0) {
+        return ret;
+    }
+
+    if (!has_remaining) {
+        ret = wxshadow_teardown_page(page_info, reason);
+        if (ret < 0)
+            return ret;
+    }
+
+    return 0;
+
+out_fail_locked:
+    wxshadow_clear_logical_release_pending(page_info);
+    wxshadow_page_pte_unlock(page_info);
+    return ret;
+
+out_fail_unlocked:
+    wxshadow_clear_logical_release_pending(page_info);
+    return ret;
+}
+
 /* ========== Set breakpoint ========== */
 
 int wxshadow_do_set_bp(void *mm, unsigned long addr)
 {
-    void *vma;
-    struct wxshadow_page *page_info;
-    void *orig_kaddr;
-    unsigned long page_addr = addr & PAGE_MASK;
+    struct wxshadow_write_ctx ctx;
     unsigned long offset = addr & ~PAGE_MASK;
-    bool is_new;
     int ret;
     int bp_idx;
 
     pr_info("wxshadow: [set_bp] addr=%lx\n", addr);
 
-    ret = require_tlb_flush_capability("set_bp");
+    ret = wxshadow_acquire_write_ctx(mm, addr, "set_bp", &ctx);
     if (ret < 0)
         return ret;
 
-    ret = acquire_shadow_page_for_write(mm, addr, page_addr, "set_bp",
-                                        &vma, &page_info, &orig_kaddr,
-                                        &is_new, NULL);
-    if (ret < 0)
-        return ret;
-
-    bp_idx = ensure_bp_slot(page_info, addr);
+    bp_idx = ensure_bp_slot(ctx.page_info, addr);
     if (bp_idx < 0) {
         pr_err("wxshadow: [set_bp] too many breakpoints on page %lx\n",
-               page_addr);
-        if (is_new)
-            destroy_unactivated_shadow_page(page_info);
-        else
-            wxshadow_page_put(page_info);
+               ctx.page_addr);
+        wxshadow_abort_write_ctx(&ctx);
         return bp_idx;
     }
 
-    if (!is_new) {
-        ret = write_shadow_u32(page_info, page_addr, offset,
+    if (!ctx.is_new) {
+        ret = write_shadow_u32(ctx.page_info, ctx.page_addr, offset,
                                WXSHADOW_BRK_INSN,
                                WXSHADOW_SHADOW_FLUSH_CACHELINE, true);
-        if (ret < 0) {
-            wxshadow_page_put(page_info);
-            return ret;
-        }
+        if (ret < 0)
+            goto out_abort;
+        wxshadow_mark_bp_dirty(ctx.page_info, offset);
+        ret = wxshadow_activate_write_ctx(&ctx, false);
+        if (ret < 0)
+            goto out_abort;
         pr_info("wxshadow: bp at %lx (existing page)\n", addr);
-        wxshadow_page_put(page_info);  /* release caller ref */
+        wxshadow_put_write_ctx(&ctx);
         return 0;
     }
 
     /* Copy original to shadow and write BRK */
-    ret = copy_original_page_to_shadow(page_info, orig_kaddr);
+    ret = wxshadow_prepare_new_write_ctx(&ctx);
     if (ret < 0)
-        goto err_free_page;
-    ret = write_shadow_u32(page_info, page_addr, offset, WXSHADOW_BRK_INSN,
+        goto out_abort;
+    ret = write_shadow_u32(ctx.page_info, ctx.page_addr, offset,
+                           WXSHADOW_BRK_INSN,
                            WXSHADOW_SHADOW_FLUSH_PAGE, false);
     if (ret < 0)
-        goto err_free_page;
+        goto out_abort;
+    wxshadow_mark_bp_dirty(ctx.page_info, offset);
 
-    ret = activate_shadow_page(vma, page_addr, page_info);
+    ret = wxshadow_activate_write_ctx(&ctx, true);
     if (ret == 0) {
         pr_info("wxshadow: bp at %lx orig_pfn=%lx shadow_pfn=%lx\n",
-                addr, page_info->pfn_original, page_info->pfn_shadow);
-        wxshadow_page_put(page_info);  /* release caller ref; page stays in list */
+                addr, ctx.page_info->pfn_original, ctx.page_info->pfn_shadow);
+        wxshadow_put_write_ctx(&ctx);
     } else {
         pr_err("wxshadow: [set_bp] switch failed\n");
-        goto err_free_page;
+        goto out_abort;
     }
 
     return ret;
 
-err_free_page:
-    destroy_unactivated_shadow_page(page_info);
+out_abort:
+    wxshadow_abort_write_ctx(&ctx);
     return ret;
 }
 
@@ -510,12 +1137,11 @@ static void *copy_from_user_via_pte(void __user *ubuf, unsigned long len)
 
 int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned long len)
 {
-    struct wxshadow_page *page_info;
-    unsigned long page_addr = addr & PAGE_MASK;
+    struct wxshadow_write_ctx ctx;
     unsigned long offset = addr & ~PAGE_MASK;
-    void *vma, *orig_kaddr, *patch_data;
-    bool is_new;
-    bool needs_activation;
+    void *patch_data;
+    void *old_patch_data = NULL;
+    unsigned long rebuild_len = len;
     int ret;
 
     pr_info("wxshadow: [patch] addr=%lx len=%lu\n", addr, len);
@@ -525,72 +1151,79 @@ int wxshadow_do_patch(void *mm, unsigned long addr, void __user *buf, unsigned l
         return -22;  /* EINVAL */
     }
 
-    ret = require_tlb_flush_capability("patch");
-    if (ret < 0)
-        return ret;
-
     /* Read user buffer into kernel memory via PTE walk */
     patch_data = copy_from_user_via_pte(buf, len);
     if (!patch_data)
         return -14;  /* EFAULT */
 
-    ret = acquire_shadow_page_for_write(mm, addr, page_addr, "patch",
-                                        &vma, &page_info, &orig_kaddr,
-                                        &is_new, &needs_activation);
+    ret = wxshadow_acquire_write_ctx(mm, addr, "patch", &ctx);
     if (ret < 0)
         goto out_free;
 
-    if (!is_new) {
-        /* Safe: ref held, shadow freed only at refcount=0 */
-        ret = write_shadow_bytes(page_info, page_addr, offset, patch_data, len,
-                                 WXSHADOW_SHADOW_FLUSH_PAGE,
-                                 !needs_activation);
+    if (!ctx.is_new) {
+        ret = upsert_patch_record(ctx.page_info, offset, len, patch_data,
+                                  &old_patch_data, &rebuild_len);
         if (ret < 0) {
-            wxshadow_page_put(page_info);
+            wxshadow_put_write_ctx(&ctx);
+            goto out_free;
+        }
+        patch_data = NULL;  /* ownership moved to page record */
+
+        ret = wxshadow_rebuild_shadow_range(ctx.page_info, offset, rebuild_len);
+        if (ret < 0) {
+            wxshadow_put_write_ctx(&ctx);
             goto out_free;
         }
 
-        if (needs_activation) {
-            ret = activate_shadow_page(vma, page_addr, page_info);
-            if (ret < 0) {
-                wxshadow_page_put(page_info);
-                goto out_free;
-            }
+        ret = wxshadow_activate_write_ctx(&ctx, false);
+        if (ret < 0) {
+            wxshadow_put_write_ctx(&ctx);
+            goto out_free;
         }
 
+        if (old_patch_data) {
+            kfunc_kfree(old_patch_data);
+            old_patch_data = NULL;
+        }
         pr_info("wxshadow: [patch] existing shadow %lx+%lx (%lu bytes)\n",
-                page_addr, offset, len);
-        wxshadow_page_put(page_info);
+                ctx.page_addr, offset, len);
+        wxshadow_put_write_ctx(&ctx);
         goto out_free;
     }
 
     /* Build shadow: original content + patch overlay */
-    ret = copy_original_page_to_shadow(page_info, orig_kaddr);
+    ret = wxshadow_prepare_new_write_ctx(&ctx);
     if (ret < 0)
         goto out_free_page;
-    ret = write_shadow_bytes(page_info, page_addr, offset, patch_data, len,
-                             WXSHADOW_SHADOW_FLUSH_PAGE, false);
+    ret = upsert_patch_record(ctx.page_info, offset, len, patch_data, NULL, NULL);
+    if (ret < 0)
+        goto out_free_page;
+    patch_data = NULL;  /* ownership moved to page record */
+
+    ret = wxshadow_rebuild_shadow_range(ctx.page_info, offset, len);
     if (ret < 0)
         goto out_free_page;
 
-    page_info->nr_bps = 0;
+    ctx.page_info->nr_bps = 0;
 
-    ret = activate_shadow_page(vma, page_addr, page_info);
+    ret = wxshadow_activate_write_ctx(&ctx, true);
     if (ret == 0) {
         pr_info("wxshadow: [patch] new shadow %lx+%lx (%lu bytes) pfn %lx->%lx\n",
-                page_addr, offset, len, page_info->pfn_original,
-                page_info->pfn_shadow);
+                ctx.page_addr, offset, len, ctx.page_info->pfn_original,
+                ctx.page_info->pfn_shadow);
     } else {
         goto out_free_page;
     }
 
-    wxshadow_page_put(page_info);  /* release caller ref; page stays in list */
+    wxshadow_put_write_ctx(&ctx);
     kfunc_kfree(patch_data);
     return 0;
 
 out_free_page:
-    destroy_unactivated_shadow_page(page_info);
+    wxshadow_abort_write_ctx(&ctx);
 out_free:
+    if (old_patch_data)
+        kfunc_kfree(old_patch_data);
     kfunc_kfree(patch_data);
     return ret;
 }
@@ -600,18 +1233,21 @@ out_free:
 int wxshadow_do_release(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page_info;
-    unsigned long page_addr = addr & PAGE_MASK;
     int ret;
 
     pr_info("wxshadow: [release] addr=%lx\n", addr);
 
-    page_info = wxshadow_find_page(mm, page_addr);
+    page_info = wxshadow_find_page(mm, addr);
     if (!page_info) {
-        pr_err("wxshadow: [release] page not found for %lx\n", addr);
-        return -2;  /* ENOENT */
+        pr_err("wxshadow: [release] no shadow page for addr=%lx (page=%lx)\n",
+               addr, addr & PAGE_MASK);
+        return -ENODATA;
     }
 
-    ret = wxshadow_teardown_page(page_info, "user release");
+    ret = wxshadow_release_mod_at_addr(page_info, addr,
+                                       WXSHADOW_RELEASE_MATCH_BP |
+                                       WXSHADOW_RELEASE_MATCH_PATCH,
+                                       "user release");
     wxshadow_page_put(page_info);
     return ret;
 }
@@ -621,74 +1257,18 @@ int wxshadow_do_release(void *mm, unsigned long addr)
 int wxshadow_do_del_bp(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page_info;
-    void *vma;
-    unsigned long page_addr = addr & PAGE_MASK;
-    unsigned long offset = addr & ~PAGE_MASK;
-    int i, bp_idx = -1;
-    int remaining_bps = 0;
     int ret;
-    void *orig_kaddr;
-    u32 orig_insn;
 
     page_info = wxshadow_find_page(mm, addr);  /* caller ref */
     if (!page_info)
         return -2;
 
-    /* Find the breakpoint */
-    for (i = 0; i < page_info->nr_bps; i++) {
-        if (page_info->bps[i].active && page_info->bps[i].addr == addr) {
-            bp_idx = i;
-        } else if (page_info->bps[i].active) {
-            remaining_bps++;
-        }
-    }
-
-    if (bp_idx < 0) {
-        wxshadow_page_put(page_info);
-        return -2;
-    }
-
-    /* Deactivate breakpoint */
-    page_info->bps[bp_idx].active = false;
-    memset(&page_info->bps[bp_idx].reg_mods, 0,
-           sizeof(page_info->bps[bp_idx].reg_mods));
-    page_info->bps[bp_idx].nr_reg_mods = 0;
-
     pr_info("wxshadow: del bp at %lx\n", addr);
-
-    if (remaining_bps > 0) {
-        /* Restore original instruction in shadow */
-        bool can_restore;
-
-        spin_lock(&global_lock);
-        can_restore = !page_info->dead && !page_info->release_pending &&
-                      page_info->state != WX_STATE_STEPPING &&
-                      page_info->shadow_page &&
-                      page_info->pfn_original;
-        spin_unlock(&global_lock);
-
-        if (can_restore) {
-            orig_kaddr = pfn_to_kaddr(page_info->pfn_original);
-            if (!is_kva((unsigned long)orig_kaddr)) {
-                pr_err("wxshadow: [del_bp] invalid orig_kaddr %px\n", orig_kaddr);
-                wxshadow_page_put(page_info);
-                return -14;
-            }
-            orig_insn = *(u32 *)((char *)orig_kaddr + offset);
-
-            ret = write_shadow_u32(page_info, page_addr, offset, orig_insn,
-                                   WXSHADOW_SHADOW_FLUSH_CACHELINE, true);
-            if (ret < 0) {
-                wxshadow_page_put(page_info);
-                return ret;
-            }
-        }
-        wxshadow_page_put(page_info);  /* release caller ref; page stays in list */
-        return 0;
-    }
-
-    /* Last BP - unified teardown handles PTE restore, free, etc. */
-    ret = wxshadow_teardown_page(page_info, "last bp removed");
+    ret = wxshadow_release_mod_at_addr(page_info, addr,
+                                       WXSHADOW_RELEASE_MATCH_BP,
+                                       "last bp removed");
+    if (ret == -ENODATA)
+        ret = -2;
     wxshadow_page_put(page_info);
     return ret;
 }
@@ -763,8 +1343,7 @@ void prctl_before(hook_fargs4_t *args, void *udata)
         mm = resolve_pid_to_mm(pid);
         if (!mm) { args->ret = -3; args->skip_origin = 1; break; }
         if (arg3 == 0) {
-            wxshadow_teardown_pages_for_mm(mm, "del_all_bp");
-            ret = 0;
+            ret = wxshadow_release_pages_for_mm(mm, "del_all_bp");
         } else {
             ret = wxshadow_do_del_bp(mm, arg3);
         }

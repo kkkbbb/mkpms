@@ -72,7 +72,7 @@ bp_release_loop() {
     while [ "$i" -lt "$LOOPS" ]; do
         run_cmd set_bp /data/local/tmp/wxshadow_client -p "$PID" -a "$BP_RET_ADDR" -r x0=999 || true
         sleep 0.01
-        run_cmd release /data/local/tmp/wxshadow_client -p "$PID" -a "$VALUE_ADDR" --release || true
+        run_cmd release /data/local/tmp/wxshadow_client -p "$PID" -a "$BP_RET_ADDR" --release || true
         i=$((i + 1))
     done
 }

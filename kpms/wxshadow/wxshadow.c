@@ -89,6 +89,7 @@ spinlock_t *kptr_debug_hook_lock;  /* kernel's debug_hook_lock for safe unregist
 void (*kfunc_rcu_read_lock)(void);
 void (*kfunc_rcu_read_unlock)(void);
 void (*kfunc_synchronize_rcu)(void);
+void (*kfunc_kick_all_cpus_sync)(void);
 
 /* Memory allocation */
 void *(*kfunc_kzalloc)(size_t size, unsigned int flags);
@@ -166,8 +167,6 @@ static struct wx_step_hook wxshadow_step_hook = {
 
 /* ========== Reference counting helpers ========== */
 
-#define WXSHADOW_RELEASE_WAIT_LOOPS 2000000
-
 /*
  * wxshadow_page_put - release one reference.
  * kfree's the struct when refcount reaches zero.
@@ -177,7 +176,9 @@ void wxshadow_page_put(struct wxshadow_page *page)
 {
     int should_free;
     unsigned long shadow_vaddr = 0;
-    unsigned long backup_vaddr = 0;
+    void *patch_data[WXSHADOW_MAX_PATCHES_PER_PAGE];
+    int nr_patch_data = 0;
+    int i;
 
     spin_lock(&global_lock);
     should_free = (--page->refcount == 0);
@@ -186,18 +187,20 @@ void wxshadow_page_put(struct wxshadow_page *page)
             shadow_vaddr = (unsigned long)page->shadow_page;
             page->shadow_page = NULL;
         }
-        if (page->orig_backup) {
-            backup_vaddr = (unsigned long)page->orig_backup;
-            page->orig_backup = NULL;
+        for (i = 0; i < page->nr_patches; i++) {
+            if (!page->patches[i].data)
+                continue;
+            patch_data[nr_patch_data++] = page->patches[i].data;
+            page->patches[i].data = NULL;
         }
     }
     spin_unlock(&global_lock);
 
     if (should_free) {
+        for (i = 0; i < nr_patch_data; i++)
+            kfunc_kfree(patch_data[i]);
         if (shadow_vaddr)
             kfunc_free_pages(shadow_vaddr, 0);
-        if (backup_vaddr)
-            kfunc_free_pages(backup_vaddr, 0);
         kfunc_kfree(page);
     }
 }
@@ -260,7 +263,7 @@ struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr)
  * Free a page structure and remove from list.
  * Marks the page dead and releases the list's reference.
  * Caller must separately release its own ref via wxshadow_page_put().
- * Shadow/backup pages are freed when the last ref drops.
+ * Shadow page memory is freed when the last ref drops.
  */
 void wxshadow_free_page(struct wxshadow_page *page)
 {
@@ -273,7 +276,7 @@ void wxshadow_free_page(struct wxshadow_page *page)
     spin_unlock(&global_lock);
 
     /* Release the list's ref.  When refcount reaches 0, page_put
-     * frees shadow_page, orig_backup, and the struct itself. */
+     * frees shadow_page and the struct itself. */
     wxshadow_page_put(page);
 }
 
@@ -285,6 +288,276 @@ struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned l
             return &page_info->bps[i];
     }
     return NULL;
+}
+
+static void wxshadow_bitmap_set_range(unsigned long *bitmap,
+                                      unsigned long offset,
+                                      unsigned long len);
+
+static void wxshadow_trim_inactive_tail_locked(struct wxshadow_page *page)
+{
+    while (page->nr_bps > 0 && !page->bps[page->nr_bps - 1].active)
+        page->nr_bps--;
+
+    while (page->nr_patches > 0 &&
+           !page->patches[page->nr_patches - 1].active &&
+           !page->patches[page->nr_patches - 1].data)
+        page->nr_patches--;
+}
+
+static void wxshadow_rebuild_dirty_tracking_locked(struct wxshadow_page *page)
+{
+    int i;
+
+    if (!page)
+        return;
+
+    memset(page->bp_dirty, 0, sizeof(page->bp_dirty));
+    memset(page->patch_dirty, 0, sizeof(page->patch_dirty));
+
+    for (i = 0; i < page->nr_bps; i++) {
+        struct wxshadow_bp *bp = &page->bps[i];
+
+        if (!bp->active)
+            continue;
+        wxshadow_bitmap_set_range(page->bp_dirty,
+                                  bp->addr & ~PAGE_MASK,
+                                  AARCH64_INSN_SIZE);
+    }
+
+    for (i = 0; i < page->nr_patches; i++) {
+        struct wxshadow_patch *patch = &page->patches[i];
+
+        if (!patch->active || patch->len == 0)
+            continue;
+        wxshadow_bitmap_set_range(page->patch_dirty,
+                                  patch->offset, patch->len);
+    }
+}
+
+static void wxshadow_bitmap_set_range(unsigned long *bitmap,
+                                      unsigned long offset,
+                                      unsigned long len)
+{
+    unsigned long i;
+
+    if (!bitmap || offset >= PAGE_SIZE || len == 0)
+        return;
+
+    if (offset + len > PAGE_SIZE)
+        len = PAGE_SIZE - offset;
+
+    for (i = offset; i < offset + len; i++) {
+        unsigned long word = i / WXSHADOW_DIRTY_WORD_BITS;
+        unsigned long bit = i % WXSHADOW_DIRTY_WORD_BITS;
+        bitmap[word] |= (1UL << bit);
+    }
+}
+
+static void wxshadow_bitmap_clear_range(unsigned long *bitmap,
+                                        unsigned long offset,
+                                        unsigned long len)
+{
+    unsigned long i;
+
+    if (!bitmap || offset >= PAGE_SIZE || len == 0)
+        return;
+
+    if (offset + len > PAGE_SIZE)
+        len = PAGE_SIZE - offset;
+
+    for (i = offset; i < offset + len; i++) {
+        unsigned long word = i / WXSHADOW_DIRTY_WORD_BITS;
+        unsigned long bit = i % WXSHADOW_DIRTY_WORD_BITS;
+        bitmap[word] &= ~(1UL << bit);
+    }
+}
+
+static bool wxshadow_bitmap_test(const unsigned long *bitmap,
+                                 unsigned long offset)
+{
+    unsigned long word;
+    unsigned long bit;
+
+    if (!bitmap || offset >= PAGE_SIZE)
+        return false;
+
+    word = offset / WXSHADOW_DIRTY_WORD_BITS;
+    bit = offset % WXSHADOW_DIRTY_WORD_BITS;
+    return !!(bitmap[word] & (1UL << bit));
+}
+
+static bool wxshadow_bitmap_any(const unsigned long *bitmap)
+{
+    unsigned long i;
+
+    if (!bitmap)
+        return false;
+
+    for (i = 0; i < WXSHADOW_DIRTY_BITMAP_WORDS; i++) {
+        if (bitmap[i])
+            return true;
+    }
+    return false;
+}
+
+void wxshadow_mark_patch_dirty(struct wxshadow_page *page, unsigned long offset,
+                               unsigned long len)
+{
+    if (!page)
+        return;
+
+    (void)offset;
+    (void)len;
+
+    spin_lock(&global_lock);
+    wxshadow_rebuild_dirty_tracking_locked(page);
+    spin_unlock(&global_lock);
+}
+
+void wxshadow_mark_bp_dirty(struct wxshadow_page *page, unsigned long offset)
+{
+    if (!page)
+        return;
+
+    (void)offset;
+
+    spin_lock(&global_lock);
+    wxshadow_rebuild_dirty_tracking_locked(page);
+    spin_unlock(&global_lock);
+}
+
+void wxshadow_clear_bp_dirty(struct wxshadow_page *page, unsigned long offset)
+{
+    if (!page)
+        return;
+
+    (void)offset;
+
+    spin_lock(&global_lock);
+    wxshadow_rebuild_dirty_tracking_locked(page);
+    spin_unlock(&global_lock);
+}
+
+void wxshadow_sync_page_tracking(struct wxshadow_page *page)
+{
+    if (!page)
+        return;
+
+    spin_lock(&global_lock);
+    wxshadow_trim_inactive_tail_locked(page);
+    wxshadow_rebuild_dirty_tracking_locked(page);
+    spin_unlock(&global_lock);
+}
+
+bool wxshadow_page_has_patch_dirty(struct wxshadow_page *page)
+{
+    bool has_dirty;
+
+    if (!page)
+        return false;
+
+    spin_lock(&global_lock);
+    has_dirty = wxshadow_bitmap_any(page->patch_dirty);
+    spin_unlock(&global_lock);
+    return has_dirty;
+}
+
+void wxshadow_clear_page_tracking(struct wxshadow_page *page)
+{
+    void *patch_data[WXSHADOW_MAX_PATCHES_PER_PAGE];
+    int nr_patch_data = 0;
+    int i;
+
+    if (!page)
+        return;
+
+    spin_lock(&global_lock);
+    for (i = 0; i < page->nr_patches; i++) {
+        if (!page->patches[i].data)
+            continue;
+        patch_data[nr_patch_data++] = page->patches[i].data;
+        page->patches[i].data = NULL;
+    }
+    page->nr_bps = 0;
+    page->nr_patches = 0;
+    page->next_mod_serial = 0;
+    memset(page->bps, 0, sizeof(page->bps));
+    memset(page->patches, 0, sizeof(page->patches));
+    memset(page->bp_dirty, 0, sizeof(page->bp_dirty));
+    memset(page->patch_dirty, 0, sizeof(page->patch_dirty));
+    spin_unlock(&global_lock);
+
+    for (i = 0; i < nr_patch_data; i++)
+        kfunc_kfree(patch_data[i]);
+}
+
+int wxshadow_restore_shadow_ranges(struct wxshadow_page *page)
+{
+    unsigned long bp_dirty[WXSHADOW_DIRTY_BITMAP_WORDS];
+    unsigned long patch_dirty[WXSHADOW_DIRTY_BITMAP_WORDS];
+    unsigned long original_pfn;
+    unsigned long shadow_vaddr;
+    unsigned long start;
+    unsigned long end;
+    unsigned long restored = 0;
+    unsigned long page_addr;
+    const char *original_kaddr;
+
+    if (!page)
+        return -22;
+
+    spin_lock(&global_lock);
+    if (!page->shadow_page || !page->pfn_original) {
+        spin_unlock(&global_lock);
+        return -14;
+    }
+    memcpy(bp_dirty, page->bp_dirty, sizeof(bp_dirty));
+    memcpy(patch_dirty, page->patch_dirty, sizeof(patch_dirty));
+    original_pfn = page->pfn_original;
+    shadow_vaddr = (unsigned long)page->shadow_page;
+    page_addr = page->page_addr;
+    spin_unlock(&global_lock);
+
+    original_kaddr = (const char *)pfn_to_kaddr(original_pfn);
+    if (!is_kva((unsigned long)original_kaddr))
+        return -14;
+
+    start = 0;
+    while (start < PAGE_SIZE) {
+        bool dirty =
+            wxshadow_bitmap_test(bp_dirty, start) ||
+            wxshadow_bitmap_test(patch_dirty, start);
+
+        if (!dirty) {
+            start++;
+            continue;
+        }
+
+        end = start + 1;
+        while (end < PAGE_SIZE) {
+            bool more_dirty =
+                wxshadow_bitmap_test(bp_dirty, end) ||
+                wxshadow_bitmap_test(patch_dirty, end);
+            if (!more_dirty)
+                break;
+            end++;
+        }
+
+        memcpy((void *)(shadow_vaddr + start),
+               original_kaddr + start,
+               end - start);
+        wxshadow_flush_kern_dcache_area(shadow_vaddr + start, end - start);
+        restored += end - start;
+        start = end;
+    }
+
+    if (restored)
+        wxshadow_flush_icache_page(page_addr);
+
+    pr_info("wxshadow: [logical_release] restored %lu bytes at addr=%lx\n",
+            restored, page_addr);
+    return 0;
 }
 
 int wxshadow_validate_page_mapping(void *mm, void *vma,
@@ -320,14 +593,8 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
     if (page_info->pfn_original && current_pfn == page_info->pfn_original) {
         if (page_info->state == WX_STATE_ORIGINAL ||
             page_info->state == WX_STATE_STEPPING ||
-            page_info->state == WX_STATE_SHADOW_X) {
-            return 1;
-        }
-    }
-
-    if (page_info->pfn_orig_backup && current_pfn == page_info->pfn_orig_backup) {
-        if (page_info->state == WX_STATE_ORIGINAL ||
-            page_info->state == WX_STATE_STEPPING) {
+            page_info->state == WX_STATE_SHADOW_X ||
+            page_info->state == WX_STATE_DORMANT) {
             return 1;
         }
     }
@@ -337,6 +604,316 @@ int wxshadow_validate_page_mapping(void *mm, void *vma,
             page_addr, current_pfn, page_info->pfn_original,
             page_info->pfn_shadow, page_info->state);
     return 0;
+}
+
+static int wxshadow_wait_for_logical_release(struct wxshadow_page *page,
+                                             const char *reason)
+{
+    int i;
+
+    for (i = 0; i < WXSHADOW_RELEASE_WAIT_LOOPS; i++) {
+        bool done;
+
+        spin_lock(&global_lock);
+        done = page->dead ||
+               (!page->logical_release_pending &&
+                page->state == WX_STATE_DORMANT);
+        spin_unlock(&global_lock);
+
+        if (done)
+            return 0;
+
+        cpu_relax();
+    }
+
+    pr_warn("wxshadow: [logical_release] timeout waiting for step completion at addr=%lx during %s\n",
+            page->page_addr, reason);
+    return -16;
+}
+
+static int wxshadow_wait_for_brk_handlers(struct wxshadow_page *page,
+                                          const char *reason)
+{
+    int i;
+
+    for (i = 0; i < WXSHADOW_RELEASE_WAIT_LOOPS; i++) {
+        bool done;
+
+        spin_lock(&global_lock);
+        done = page->dead || page->brk_in_flight == 0;
+        spin_unlock(&global_lock);
+
+        if (done)
+            return 0;
+
+        cpu_relax();
+    }
+
+    pr_warn("wxshadow: [%s] timeout waiting for in-flight BRK handlers at addr=%lx\n",
+            reason, page->page_addr);
+    return -16;
+}
+
+void wxshadow_sync_shadow_exec_zero(struct wxshadow_page *page,
+                                    const char *reason)
+{
+    if (!kfunc_kick_all_cpus_sync) {
+        pr_err("wxshadow: [%s] kick_all_cpus_sync unavailable at addr=%lx\n",
+               reason, page ? page->page_addr : 0UL);
+        return;
+    }
+
+    kfunc_kick_all_cpus_sync();
+}
+
+static void wxshadow_clear_logical_release_pending_locked(
+    struct wxshadow_page *page)
+{
+    if (page && !page->dead)
+        page->logical_release_pending = false;
+}
+
+static void wxshadow_clear_logical_release_pending(struct wxshadow_page *page)
+{
+    spin_lock(&global_lock);
+    wxshadow_clear_logical_release_pending_locked(page);
+    spin_unlock(&global_lock);
+}
+
+static int wxshadow_release_page_to_clean_shadow(struct wxshadow_page *page,
+                                                 const char *reason)
+{
+    void *mm;
+    void *vma;
+    u64 probe;
+    int state;
+    int ret;
+
+    if (!page)
+        return 0;
+
+retry:
+    wxshadow_page_pte_lock(page);
+
+    spin_lock(&global_lock);
+    if (page->dead) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        return 0;
+    }
+
+    if (page->release_pending) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        return -16;
+    }
+
+    if (page->brk_in_flight > 0) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        ret = wxshadow_wait_for_brk_handlers(page, reason);
+        if (ret < 0)
+            return ret;
+        goto retry;
+    }
+
+    if (page->logical_release_pending) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        cpu_relax();
+        goto retry;
+    }
+
+    state = page->state;
+    page->logical_release_pending = true;
+    spin_unlock(&global_lock);
+
+    if (state != WX_STATE_DORMANT && state != WX_STATE_NONE) {
+        mm = page->mm;
+        if (!mm || !page->pfn_original || !kfunc_find_vma) {
+            ret = -14;
+            goto out_fail_locked;
+        }
+
+        if (!is_kva((unsigned long)mm) ||
+            !safe_read_u64((unsigned long)mm, &probe)) {
+            ret = -14;
+            goto out_fail_locked;
+        }
+
+        vma = kfunc_find_vma(mm, page->page_addr);
+        if (!vma || vma_start(vma) > page->page_addr) {
+            ret = -14;
+            goto out_fail_locked;
+        }
+
+        ret = wxshadow_page_enter_dormant_locked(page, vma, page->page_addr);
+        if (ret < 0)
+            goto out_fail_locked;
+    }
+
+    wxshadow_page_pte_unlock(page);
+
+    wxshadow_sync_shadow_exec_zero(page, reason);
+
+    ret = wxshadow_wait_for_brk_handlers(page, reason);
+    if (ret < 0)
+        goto out_fail_unlocked;
+
+    wxshadow_page_pte_lock(page);
+
+    spin_lock(&global_lock);
+    if (page->dead) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        return 0;
+    }
+    if (page->release_pending || page->brk_in_flight > 0 ||
+        page->state == WX_STATE_STEPPING) {
+        wxshadow_clear_logical_release_pending_locked(page);
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        cpu_relax();
+        goto retry;
+    }
+    spin_unlock(&global_lock);
+
+    ret = wxshadow_restore_shadow_ranges(page);
+    if (ret < 0) {
+        goto out_fail_locked;
+    }
+
+    wxshadow_clear_page_tracking(page);
+    spin_lock(&global_lock);
+    wxshadow_clear_logical_release_pending_locked(page);
+    spin_unlock(&global_lock);
+    wxshadow_page_pte_unlock(page);
+
+    pr_info("wxshadow: [release_clean] %s: addr=%lx mapping retained\n",
+            reason, page->page_addr);
+    return 0;
+
+out_fail_locked:
+    spin_lock(&global_lock);
+    wxshadow_clear_logical_release_pending_locked(page);
+    spin_unlock(&global_lock);
+    wxshadow_page_pte_unlock(page);
+    pr_warn("wxshadow: [release_clean] %s failed for addr=%lx: %d\n",
+            reason, page->page_addr, ret);
+    return ret;
+
+out_fail_unlocked:
+    wxshadow_clear_logical_release_pending(page);
+    pr_warn("wxshadow: [release_clean] %s failed while draining BRK handlers for addr=%lx: %d\n",
+            reason, page->page_addr, ret);
+    return ret;
+}
+
+int wxshadow_release_page_logically(struct wxshadow_page *page,
+                                    const char *reason)
+{
+    void *mm;
+    void *vma;
+    u64 probe;
+    int state;
+    int ret;
+
+    if (!page)
+        return 0;
+
+retry:
+    wxshadow_page_pte_lock(page);
+
+    spin_lock(&global_lock);
+    if (page->dead) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        return 0;
+    }
+
+    if (page->brk_in_flight > 0) {
+        spin_unlock(&global_lock);
+        wxshadow_page_pte_unlock(page);
+        ret = wxshadow_wait_for_brk_handlers(page, reason);
+        if (ret < 0)
+            return ret;
+        goto retry;
+    }
+
+    state = page->state;
+    if (state == WX_STATE_DORMANT || state == WX_STATE_NONE) {
+        wxshadow_clear_logical_release_pending_locked(page);
+        spin_unlock(&global_lock);
+        wxshadow_clear_page_tracking(page);
+        wxshadow_page_pte_unlock(page);
+        return 0;
+    }
+
+    page->logical_release_pending = true;
+    if (state == WX_STATE_STEPPING &&
+        page->stepping_task && page->stepping_task != current) {
+        spin_unlock(&global_lock);
+
+        ret = wxshadow_restore_shadow_ranges(page);
+        if (ret == 0)
+            wxshadow_clear_page_tracking(page);
+        else {
+            wxshadow_clear_logical_release_pending(page);
+        }
+
+        wxshadow_page_pte_unlock(page);
+        if (ret < 0)
+            return ret;
+
+        pr_info("wxshadow: [logical_release] %s: addr=%lx state=%d pending until step completes\n",
+                reason, page->page_addr, state);
+        return wxshadow_wait_for_logical_release(page, reason);
+    }
+    spin_unlock(&global_lock);
+
+    ret = wxshadow_restore_shadow_ranges(page);
+    if (ret < 0)
+        goto out_fail;
+
+    mm = page->mm;
+    if (!mm || !page->pfn_original || !kfunc_find_vma) {
+        ret = -14;
+        goto out_fail;
+    }
+
+    if (!is_kva((unsigned long)mm) ||
+        !safe_read_u64((unsigned long)mm, &probe)) {
+        ret = -14;
+        goto out_fail;
+    }
+
+    vma = kfunc_find_vma(mm, page->page_addr);
+    if (!vma || vma_start(vma) > page->page_addr) {
+        ret = -14;
+        goto out_fail;
+    }
+
+    ret = wxshadow_page_enter_dormant_locked(page, vma, page->page_addr);
+    if (ret < 0)
+        goto out_fail;
+
+    wxshadow_clear_page_tracking(page);
+
+    spin_lock(&global_lock);
+    wxshadow_clear_logical_release_pending_locked(page);
+    spin_unlock(&global_lock);
+
+    pr_info("wxshadow: [logical_release] %s: addr=%lx state=%d -> DORMANT\n",
+            reason, page->page_addr, state);
+    wxshadow_page_pte_unlock(page);
+    return 0;
+
+out_fail:
+    wxshadow_clear_logical_release_pending(page);
+    wxshadow_page_pte_unlock(page);
+    pr_warn("wxshadow: [logical_release] %s failed for addr=%lx: %d\n",
+            reason, page->page_addr, ret);
+    return ret;
 }
 
 static int wxshadow_wait_for_teardown(struct wxshadow_page *page,
@@ -363,18 +940,60 @@ static int wxshadow_wait_for_teardown(struct wxshadow_page *page,
 }
 
 /*
+ * If teardown cannot actively restore the original PTE, only finalize when
+ * the userspace mapping is already gone or no longer points at our private
+ * shadow PFNs.
+ */
+static bool wxshadow_can_finalize_failed_teardown(struct wxshadow_page *page)
+{
+    void *mm;
+    u64 probe;
+    u64 *ptep;
+    u64 pte_val;
+    unsigned long current_pfn;
+
+    if (!page)
+        return false;
+
+    if (!page->pfn_shadow)
+        return true;
+
+    mm = page->mm;
+    if (!mm || !is_kva((unsigned long)mm) ||
+        !safe_read_u64((unsigned long)mm, &probe))
+        return false;
+
+    ptep = get_user_pte(mm, page->page_addr, NULL);
+    if (!ptep)
+        return true;
+
+    pte_val = *ptep;
+    if (!(pte_val & PTE_VALID))
+        return true;
+
+    current_pfn = (pte_val & 0x0000FFFFFFFFF000UL) >> PAGE_SHIFT;
+    if (page->pfn_shadow && current_pfn == page->pfn_shadow) {
+        pr_err("wxshadow: [teardown] addr=%lx still mapped to private pfn=%lx after restore failure\n",
+               page->page_addr, current_pfn);
+        return false;
+    }
+
+    return true;
+}
+
+/*
  * wxshadow_teardown_page - unified page cleanup.
  *
  * Performs a complete, safe teardown of a shadow page:
- *   1. Under global_lock: mark dead, clear stepping_task, zero pfn_shadow/
- *      pfn_orig_backup, remove from page_list (if still present).
+ *   1. Under global_lock: mark dead, clear stepping_task, zero pfn_shadow,
+ *      remove from page_list (if still present).
  *   2. Disable single-step on the stepping task (with pointer validation).
  *   3. Brief spin for any concurrent step-handler that already passed the
  *      dead check (covers the STEPPING race window).
  *   4. Restore PTE to original page (if mm and VMA are still valid).
  *   5. Release the list's reference via wxshadow_page_put().
  *
- * Shadow/backup page memory is NOT freed here — it is freed in
+ * Shadow page memory is NOT freed here — it is freed in
  * wxshadow_page_put() when the last reference drops, preventing
  * use-after-free by concurrent ref holders.
  *
@@ -389,6 +1008,7 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
     void *stepping = NULL;
     int state;
     bool was_in_list;
+    bool finalize_teardown = true;
     int ret = 0;
 
     if (!page)
@@ -470,26 +1090,46 @@ int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason)
         ret = -14;
     }
 
+    if (ret < 0) {
+        finalize_teardown = wxshadow_can_finalize_failed_teardown(page);
+        if (!finalize_teardown) {
+            spin_lock(&global_lock);
+            if (!page->dead)
+                page->release_pending = false;
+            spin_unlock(&global_lock);
+            wxshadow_page_pte_unlock(page);
+            pr_err("wxshadow: [teardown] retaining page for addr=%lx after restore failure (%d)\n",
+                   page->page_addr, ret);
+            return ret;
+        }
+
+        pr_warn("wxshadow: [teardown] finalize without restore for addr=%lx; mapping already detached\n",
+                page->page_addr);
+        ret = 0;
+    } else {
+        wxshadow_sync_shadow_exec_zero(page, reason);
+    }
+
     /* --- Step 5: mark dead, drop from list after mapping is restored --- */
     spin_lock(&global_lock);
     if (!page->dead) {
         page->dead = true;
         page->release_pending = false;
+        page->logical_release_pending = false;
         page->state = WX_STATE_NONE;
         page->stepping_task = NULL;
 
-        /* Resource pointers (shadow_page, orig_backup) are NOT freed here.
+        /* Resource pointer shadow_page is NOT freed here.
          * They are freed in wxshadow_page_put when refcount reaches 0,
          * ensuring no use-after-free by concurrent ref holders. */
         page->pfn_shadow = 0;
-        page->pfn_orig_backup = 0;
 
         if (was_in_list && !list_empty(&page->list))
             list_del_init(&page->list);
     }
     spin_unlock(&global_lock);
 
-    /* Shadow/backup pages freed when last ref drops in page_put */
+    /* Shadow page freed when last ref drops in page_put */
     if (was_in_list)
         wxshadow_page_put(page);
 
@@ -532,17 +1172,8 @@ static int wxshadow_teardown_pages_for_mm_impl(void *mm, const char *reason,
             if (ret < 0 && first_err == 0)
                 first_err = ret;
             if (ret < 0) {
-                bool still_live;
-
-                spin_lock(&global_lock);
-                still_live = !page->dead;
-                spin_unlock(&global_lock);
                 wxshadow_page_put(page);
-                count++;
-
-                if (still_live)
-                    break;
-                continue;
+                break;
             }
         }
         wxshadow_page_put(page);
@@ -565,12 +1196,73 @@ int wxshadow_teardown_pages_for_mm(void *mm, const char *reason)
 
 int wxshadow_release_pages_for_mm(void *mm, const char *reason)
 {
-    return wxshadow_teardown_pages_for_mm_impl(mm, reason, true);
+    struct wxshadow_page *batch[32];
+    struct list_head *pos;
+    int nr;
+    int i;
+    int count = 0;
+    int first_err = 0;
+    bool stop = false;
+
+    do {
+        nr = 0;
+
+        spin_lock(&global_lock);
+        list_for_each(pos, &page_list) {
+            struct wxshadow_page *p =
+                container_of(pos, struct wxshadow_page, list);
+
+            if (p->dead || p->state == WX_STATE_NONE ||
+                p->state == WX_STATE_DORMANT || !p->pfn_shadow)
+                continue;
+            if (mm && p->mm != mm)
+                continue;
+
+            p->refcount++;
+            batch[nr++] = p;
+            if (nr >= (int)(sizeof(batch) / sizeof(batch[0])))
+                break;
+        }
+        spin_unlock(&global_lock);
+
+        if (nr == 0)
+            break;
+
+        for (i = 0; i < nr; i++) {
+            int ret = wxshadow_release_page_to_clean_shadow(batch[i], reason);
+
+            if (ret < 0 && first_err == 0)
+                first_err = ret;
+            if (ret < 0) {
+                bool still_active;
+
+                spin_lock(&global_lock);
+                still_active = !batch[i]->dead &&
+                               batch[i]->state != WX_STATE_DORMANT;
+                spin_unlock(&global_lock);
+                if (still_active)
+                    stop = true;
+            }
+
+            wxshadow_page_put(batch[i]);
+            count++;
+        }
+    } while (!stop && nr == (int)(sizeof(batch) / sizeof(batch[0])));
+
+    if (count > 0)
+        pr_info("wxshadow: [%s] logically released %d pages\n",
+                reason, count);
+    if (first_err < 0)
+        pr_warn("wxshadow: [%s] logical release saw failures, first=%d\n",
+                reason, first_err);
+
+    return first_err;
 }
 
 int wxshadow_handle_write_fault(void *mm, unsigned long addr)
 {
     struct wxshadow_page *page;
+    int ret;
 
     page = wxshadow_find_page(mm, addr);  /* caller ref */
     if (!page)
@@ -583,7 +1275,21 @@ int wxshadow_handle_write_fault(void *mm, unsigned long addr)
 
     pr_info("wxshadow: write fault at %lx - page content changing\n", addr);
 
-    wxshadow_teardown_page(page, "Write Fault (page modified)");
+    ret = wxshadow_release_page_logically(page,
+                                          "Write Fault (page modified)");
+    if (ret == 0) {
+        /*
+         * The fault will continue through the kernel's normal write path after
+         * we return, so any cached original PFN may become stale due to COW or
+         * a successful write-protect resolution. Re-snapshot on next reuse.
+         */
+        spin_lock(&global_lock);
+        if (!page->dead && page->state == WX_STATE_DORMANT) {
+            page->pfn_original = 0;
+            page->pte_original = 0;
+        }
+        spin_unlock(&global_lock);
+    }
     wxshadow_page_put(page);
 
     return -1;
@@ -757,16 +1463,24 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         }
     }
 
-    /* Hook exit_mmap */
-    if (kfunc_exit_mmap) {
-        ret = hook_wrap1(kfunc_exit_mmap, exit_mmap_before, NULL, NULL);
-        if (ret != HOOK_NO_ERR) {
-            pr_warn("wxshadow: failed to hook exit_mmap: %d\n", ret);
-            pr_warn("wxshadow: process exit may cause Bad page map errors\n");
-            kfunc_exit_mmap = NULL;
-        } else {
-            pr_info("wxshadow: hooked exit_mmap for proper cleanup\n");
+    /* Hook exit_mmap - required for safe teardown on process exit */
+    ret = hook_wrap1(kfunc_exit_mmap, exit_mmap_before, NULL, NULL);
+    if (ret != HOOK_NO_ERR) {
+        pr_err("wxshadow: failed to hook exit_mmap: %d\n", ret);
+        pr_err("wxshadow: refusing to load without exit_mmap cleanup\n");
+        if (kfunc_do_page_fault)
+            hook_unwrap(kfunc_do_page_fault, do_page_fault_before, NULL);
+        unhook_syscalln(__NR_prctl, prctl_before, NULL);
+        if (hook_method == WX_HOOK_METHOD_DIRECT) {
+            hook_unwrap(kfunc_single_step_handler, single_step_handler_before, NULL);
+            hook_unwrap(kfunc_brk_handler, brk_handler_before, NULL);
+        } else if (hook_method == WX_HOOK_METHOD_REGISTER) {
+            wx_unregister_brk_step_hooks();
         }
+        hook_method = WX_HOOK_METHOD_NONE;
+        return -1;
+    } else {
+        pr_info("wxshadow: hooked exit_mmap for proper cleanup\n");
     }
 
     /* Hook follow_page_pte for GUP hiding (/proc/pid/mem, process_vm_readv, ptrace) */
@@ -784,10 +1498,11 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
     /* Hook copy_process for fork protection (optional) */
     if (patch_config) {
         unsigned long cp_addr = patch_config->copy_process;
-        unsigned long cpf_addr = patch_config->cgroup_post_fork;
         if (cp_addr) {
             kfunc_copy_process = (void *)cp_addr;
-            ret = hook_wrap8(kfunc_copy_process, NULL, after_copy_process_wx, NULL);
+            ret = hook_wrap8(kfunc_copy_process,
+                             before_copy_process_wx,
+                             after_copy_process_wx, NULL);
             if (ret != HOOK_NO_ERR) {
                 pr_warn("wxshadow: failed to hook copy_process: %d\n", ret);
                 kfunc_copy_process = NULL;
@@ -796,19 +1511,8 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
                         kfunc_copy_process);
             }
         }
-        if (!kfunc_copy_process && cpf_addr) {
-            kfunc_cgroup_post_fork = (void *)cpf_addr;
-            ret = hook_wrap4(kfunc_cgroup_post_fork, NULL, after_cgroup_post_fork_wx, NULL);
-            if (ret != HOOK_NO_ERR) {
-                pr_warn("wxshadow: failed to hook cgroup_post_fork: %d\n", ret);
-                kfunc_cgroup_post_fork = NULL;
-            } else {
-                pr_info("wxshadow: hooked cgroup_post_fork at %px for fork protection\n",
-                        kfunc_cgroup_post_fork);
-            }
-        }
-        if (!kfunc_copy_process && !kfunc_cgroup_post_fork) {
-            pr_warn("wxshadow: fork protection DISABLED (no copy_process/cgroup_post_fork)\n");
+        if (!kfunc_copy_process) {
+            pr_warn("wxshadow: fork protection DISABLED (copy_process hook unavailable; post-fork child PTE rewrite is unsafe)\n");
         }
     } else {
         pr_warn("wxshadow: patch_config not available, fork protection DISABLED\n");
@@ -904,19 +1608,14 @@ static long wxshadow_exit(void *__user reserved)
     page_count = wxshadow_teardown_pages_for_mm(NULL, "module unload");
 
     /*
-     * Phase 2.5: Unhook fork protection (copy_process / cgroup_post_fork).
+     * Phase 2.5: Unhook fork protection (copy_process).
      * Must be done before BRK/step unhook — fork handler may reference
      * shadow pages, but page_list is already empty so it will be a no-op.
      */
     if (kfunc_copy_process) {
-        hook_unwrap(kfunc_copy_process, NULL, after_copy_process_wx);
+        hook_unwrap(kfunc_copy_process, before_copy_process_wx, after_copy_process_wx);
         pr_info("wxshadow: unhooked copy_process (phase 2.5)\n");
         wait_for_handlers_drain("phase2.5-copy_process");
-    }
-    if (kfunc_cgroup_post_fork) {
-        hook_unwrap(kfunc_cgroup_post_fork, NULL, after_cgroup_post_fork_wx);
-        pr_info("wxshadow: unhooked cgroup_post_fork (phase 2.5)\n");
-        wait_for_handlers_drain("phase2.5-cgroup_post_fork");
     }
 
     /*

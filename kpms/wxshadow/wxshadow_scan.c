@@ -74,12 +74,13 @@ int resolve_symbols(void)
     RESOLVE_SYMBOL(mmput);
     /* find_task_by_vpid: use wxfunc(find_task_by_vpid) */
 
-    /* exit_mmap - optional, for proper cleanup on process exit */
+    /* exit_mmap - required, for proper cleanup on process exit */
     kfunc_exit_mmap = (void *)lookup_name_safe("exit_mmap");
     if (kfunc_exit_mmap) {
         pr_info("wxshadow: exit_mmap found at %px\n", kfunc_exit_mmap);
     } else {
-        pr_warn("wxshadow: exit_mmap not found, process exit may cause Bad page map\n");
+        pr_err("wxshadow: exit_mmap not found, refusing to load without exit cleanup\n");
+        return -ESRCH;
     }
 
     /* ===== Page allocation ===== */
@@ -318,11 +319,18 @@ int resolve_symbols(void)
         lookup_name_safe("__rcu_read_unlock");
     kfunc_synchronize_rcu = (typeof(kfunc_synchronize_rcu))
         lookup_name_safe("synchronize_rcu");
+    kfunc_kick_all_cpus_sync = (typeof(kfunc_kick_all_cpus_sync))
+        lookup_name_safe("kick_all_cpus_sync");
     if (!kfunc_rcu_read_lock || !kfunc_rcu_read_unlock) {
         pr_err("wxshadow: RCU functions not found\n");
         return -1;
     }
+    if (!kfunc_kick_all_cpus_sync) {
+        pr_err("wxshadow: kick_all_cpus_sync not found, refusing to load\n");
+        return -ESRCH;
+    }
     pr_info("wxshadow: synchronize_rcu = %px\n", kfunc_synchronize_rcu);
+    pr_info("wxshadow: kick_all_cpus_sync = %px\n", kfunc_kick_all_cpus_sync);
 
     /* ===== Memory allocation ===== */
     pr_info("wxshadow: [12/12] memory alloc...\n");

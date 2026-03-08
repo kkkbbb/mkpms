@@ -48,6 +48,7 @@ enum wxshadow_state {
     WX_STATE_ORIGINAL,      /* VA mapped to original page (r--) */
     WX_STATE_SHADOW_X,      /* VA mapped to shadow, permission --x */
     WX_STATE_STEPPING,      /* Single-stepping original instruction (r-x) */
+    WX_STATE_DORMANT,       /* Hook retired; VA restored to original, shadow kept */
 };
 
 /* Maximum register modifications per breakpoint */
@@ -55,6 +56,12 @@ enum wxshadow_state {
 
 /* Maximum breakpoints per page */
 #define WXSHADOW_MAX_BPS_PER_PAGE   16
+#define WXSHADOW_MAX_PATCHES_PER_PAGE 32
+#define WXSHADOW_MAX_ACTIVE_MODS_PER_PAGE \
+    (WXSHADOW_MAX_BPS_PER_PAGE + WXSHADOW_MAX_PATCHES_PER_PAGE)
+#define WXSHADOW_DIRTY_WORD_BITS    (sizeof(unsigned long) * 8)
+#define WXSHADOW_DIRTY_BITMAP_WORDS \
+    ((PAGE_SIZE + WXSHADOW_DIRTY_WORD_BITS - 1) / WXSHADOW_DIRTY_WORD_BITS)
 
 /* Register modification entry */
 struct wxshadow_reg_mod {
@@ -67,8 +74,17 @@ struct wxshadow_reg_mod {
 struct wxshadow_bp {
     unsigned long addr;     /* Breakpoint address */
     bool active;            /* Whether this bp is active */
+    u64 serial;             /* Last write order on shadow page */
     struct wxshadow_reg_mod reg_mods[WXSHADOW_MAX_REG_MODS];
     int nr_reg_mods;        /* Number of active register modifications */
+};
+
+struct wxshadow_patch {
+    u16 offset;             /* Patch start offset within page */
+    u16 len;                /* Patch length in bytes */
+    bool active;            /* Whether this patch record is active */
+    u64 serial;             /* Last write order on shadow page */
+    void *data;             /* Patched bytes, len bytes */
 };
 
 /* Per-page shadow info (dynamically allocated per breakpoint page) */
@@ -79,12 +95,12 @@ struct wxshadow_page {
     unsigned long page_addr;        /* Page start address (for lookup) */
 
     unsigned long pfn_original;     /* Original page PFN */
+    u64 pte_original;               /* Original user PTE snapshot */
     unsigned long pfn_shadow;       /* Shadow page PFN */
     void *shadow_page;              /* Shadow page kernel VA (for free) */
-    void *orig_backup;              /* Backup copy of original page (kernel VA) */
-    unsigned long pfn_orig_backup;  /* PFN of orig_backup */
     enum wxshadow_state state;      /* Current state */
     void *stepping_task;            /* Task currently single-stepping */
+    int brk_in_flight;              /* BRK handlers between trap and STEPPING */
 
     /*
      * Lifecycle fields (protected by global_lock):
@@ -100,15 +116,31 @@ struct wxshadow_page {
      *             STEPPING state.  The page stays in page_list so the step
      *             handler can finalize the teardown after the original
      *             instruction retires.
+     *   logical_release_pending:
+     *             set when a user-facing release wants to retire the hook
+     *             without tearing down the page.  The step handler switches the
+     *             page into DORMANT once the original instruction retires.
+     *   fork_paused:
+     *             set while copy_process is cloning the parent's mm.  The
+     *             parent PTE is temporarily restored to the original page so
+     *             the child never inherits the shadow PFN; after copy_process
+     *             returns, the parent mapping is switched back to shadow.
      */
     int  refcount;
     bool dead;
     bool release_pending;
+    bool logical_release_pending;
+    bool fork_paused;
     atomic_t pte_lock;            /* Serializes PTE rewrites for this page */
 
     /* Breakpoint info */
     struct wxshadow_bp bps[WXSHADOW_MAX_BPS_PER_PAGE];
     int nr_bps;                     /* Number of breakpoints */
+    struct wxshadow_patch patches[WXSHADOW_MAX_PATCHES_PER_PAGE];
+    int nr_patches;                 /* Number of patch records */
+    u64 next_mod_serial;            /* Monotonic shadow write serial */
+    unsigned long bp_dirty[WXSHADOW_DIRTY_BITMAP_WORDS];
+    unsigned long patch_dirty[WXSHADOW_DIRTY_BITMAP_WORDS];
 };
 
 /* BRK handler return values */

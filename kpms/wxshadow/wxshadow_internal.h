@@ -39,7 +39,7 @@ static inline void cpu_relax(void)
 /*
  * Per-page PTE rewrite lock.
  * This is a logical lock, not the kernel page-table lock: it serializes
- * wxshadow's own PTE transitions (shadow/original/backup) for one page so
+ * wxshadow's own PTE transitions (shadow/original) for one page so
  * release/fault/step/GUP paths cannot race each other.
  */
 static inline void wxshadow_page_pte_lock(struct wxshadow_page *page)
@@ -159,6 +159,7 @@ extern spinlock_t *kptr_debug_hook_lock;
 extern void (*kfunc_rcu_read_lock)(void);
 extern void (*kfunc_rcu_read_unlock)(void);
 extern void (*kfunc_synchronize_rcu)(void);
+extern void (*kfunc_kick_all_cpus_sync)(void);
 
 /* Memory allocation */
 extern void *(*kfunc_kzalloc)(size_t size, unsigned int flags);
@@ -217,6 +218,8 @@ extern atomic_t wx_in_flight;
 #define WX_HANDLER_ENTER() atomic_inc(&wx_in_flight)
 #define WX_HANDLER_EXIT()  atomic_dec(&wx_in_flight)
 
+#define WXSHADOW_RELEASE_WAIT_LOOPS 2000000
+
 /* init_task: use init_task from linux/init_task.h (KernelPatch framework) */
 
 /* ========== BRK/Step hook ========== */
@@ -232,6 +235,8 @@ extern atomic_t wx_in_flight;
 #define ESR_ELx_ISS_MASK        0x01FFFFFFUL
 #define ESR_ELx_WNR_SHIFT       6
 #define ESR_ELx_WNR             (1UL << ESR_ELx_WNR_SHIFT)
+#define ESR_ELx_S1PTW_SHIFT     7
+#define ESR_ELx_S1PTW           (1UL << ESR_ELx_S1PTW_SHIFT)
 #define ESR_ELx_CM_SHIFT        8
 #define ESR_ELx_CM              (1UL << ESR_ELx_CM_SHIFT)
 
@@ -246,15 +251,48 @@ static inline bool is_el0_instruction_abort(unsigned int esr)
     return ESR_ELx_EC(esr) == ESR_ELx_EC_IABT_LOW;
 }
 
-static inline bool is_write_abort(unsigned int esr)
+static inline bool is_el0_data_abort(unsigned int esr)
 {
-    return (esr & ESR_ELx_WNR) != 0;
+    return ESR_ELx_EC(esr) == ESR_ELx_EC_DABT_LOW;
 }
 
 static inline bool is_permission_fault(unsigned int esr)
 {
     unsigned int fsc = esr & 0x3F;
     return (fsc & 0x3C) == 0x0C;
+}
+
+enum wxshadow_fault_access {
+    WXSHADOW_FAULT_NONE = 0,
+    WXSHADOW_FAULT_EXEC,
+    WXSHADOW_FAULT_READ,
+    WXSHADOW_FAULT_WRITE,
+};
+
+static inline enum wxshadow_fault_access
+wxshadow_classify_permission_fault(unsigned int esr)
+{
+    if (!is_permission_fault(esr))
+        return WXSHADOW_FAULT_NONE;
+
+    if (is_el0_instruction_abort(esr))
+        return WXSHADOW_FAULT_EXEC;
+
+    if (!is_el0_data_abort(esr))
+        return WXSHADOW_FAULT_NONE;
+
+    /*
+     * Cache maintenance and stage-1 page-table walk faults are not direct
+     * writes to the tracked page contents. Treat CM like a read-side access so
+     * we can flip back to the original mapping, and ignore S1PTW entirely.
+     */
+    if (esr & ESR_ELx_S1PTW)
+        return WXSHADOW_FAULT_NONE;
+    if (esr & ESR_ELx_CM)
+        return WXSHADOW_FAULT_READ;
+
+    return (esr & ESR_ELx_WNR) ? WXSHADOW_FAULT_WRITE
+                               : WXSHADOW_FAULT_READ;
 }
 
 /*
@@ -468,11 +506,23 @@ struct wxshadow_page *wxshadow_find_page(void *mm, unsigned long addr);
 struct wxshadow_page *wxshadow_create_page(void *mm, unsigned long page_addr);
 void wxshadow_free_page(struct wxshadow_page *page);
 struct wxshadow_bp *wxshadow_find_bp(struct wxshadow_page *page_info, unsigned long addr);
+void wxshadow_sync_page_tracking(struct wxshadow_page *page);
 int wxshadow_validate_page_mapping(void *mm, void *vma, struct wxshadow_page *page_info, unsigned long page_addr);
 int wxshadow_teardown_page(struct wxshadow_page *page, const char *reason);
 int wxshadow_teardown_pages_for_mm(void *mm, const char *reason);
+int wxshadow_release_page_logically(struct wxshadow_page *page,
+                                    const char *reason);
 int wxshadow_release_pages_for_mm(void *mm, const char *reason);
 int wxshadow_handle_write_fault(void *mm, unsigned long addr);
+void wxshadow_sync_shadow_exec_zero(struct wxshadow_page *page,
+                                    const char *reason);
+void wxshadow_mark_patch_dirty(struct wxshadow_page *page, unsigned long offset,
+                               unsigned long len);
+void wxshadow_mark_bp_dirty(struct wxshadow_page *page, unsigned long offset);
+void wxshadow_clear_bp_dirty(struct wxshadow_page *page, unsigned long offset);
+bool wxshadow_page_has_patch_dirty(struct wxshadow_page *page);
+void wxshadow_clear_page_tracking(struct wxshadow_page *page);
+int wxshadow_restore_shadow_ranges(struct wxshadow_page *page);
 
 /* ========== Page table functions (wxshadow_pgtable.c) ========== */
 
@@ -483,6 +533,8 @@ void wxshadow_flush_tlb_page(void *vma, unsigned long uaddr);
 u64 make_pte(unsigned long pfn, u64 prot);
 int wxshadow_page_activate_shadow(struct wxshadow_page *page, void *vma,
                                   unsigned long addr);
+int wxshadow_page_activate_shadow_locked(struct wxshadow_page *page, void *vma,
+                                         unsigned long addr);
 int wxshadow_page_enter_original(struct wxshadow_page *page, void *vma,
                                  unsigned long addr);
 int wxshadow_page_resume_shadow(struct wxshadow_page *page, void *vma,
@@ -502,11 +554,13 @@ int wxshadow_page_finish_gup_hide(struct wxshadow_page *page, void *vma,
 int wxshadow_page_restore_child_original_locked(struct wxshadow_page *page,
                                                 void *child_mm,
                                                 unsigned long addr);
+int wxshadow_page_enter_dormant_locked(struct wxshadow_page *page, void *vma,
+                                       unsigned long addr);
 
 /* ========== Fork handler (wxshadow_handlers.c) ========== */
 
+void before_copy_process_wx(hook_fargs8_t *args, void *udata);
 void after_copy_process_wx(hook_fargs8_t *args, void *udata);
-void after_cgroup_post_fork_wx(hook_fargs4_t *args, void *udata);
 
 /* ========== Fault handler functions (wxshadow_handlers.c) ========== */
 

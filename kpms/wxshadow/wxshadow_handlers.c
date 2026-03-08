@@ -12,7 +12,7 @@
 /* ========== Read/Exec Fault handlers ========== */
 
 /*
- * Handle read fault - switch to original page with r-- permission
+ * Handle read fault - switch to the live original page with r-- permission
  * This allows integrity checks to see original code instead of BRK.
  * Returns 0 if handled, -1 if not our fault
  */
@@ -22,10 +22,20 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
     unsigned long page_addr = addr & PAGE_MASK;
     void *vma;
     int ret;
+    bool should_switch;
 
     page_info = wxshadow_find_page(mm, addr);  /* caller ref */
     if (!page_info)
         return -1;
+
+    spin_lock(&global_lock);
+    should_switch = !page_info->dead &&
+                    page_info->state == WX_STATE_SHADOW_X;
+    spin_unlock(&global_lock);
+    if (!should_switch) {
+        wxshadow_page_put(page_info);
+        return -1;
+    }
 
     /* Get VMA for page switching (lockless) */
     vma = kfunc_find_vma(mm, addr);
@@ -44,7 +54,7 @@ int wxshadow_handle_read_fault(void *mm, unsigned long addr)
 
     ret = wxshadow_page_enter_original(page_info, vma, page_addr);
     if (ret == 0)
-        pr_info("wxshadow: read fault at %lx, switched to orig_backup (r--)\n", addr);
+        pr_info("wxshadow: read fault at %lx, switched to live original (r--)\n", addr);
 
     wxshadow_page_put(page_info);  /* release caller ref */
     return ret == 0 ? 0 : -1;
@@ -62,6 +72,7 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
     void *shadow_kaddr;
     void *vma;
     int ret;
+    bool should_switch;
 
     page_info = wxshadow_find_page(mm, addr);  /* caller ref */
     if (!page_info)
@@ -69,7 +80,13 @@ int wxshadow_handle_exec_fault(void *mm, unsigned long addr)
 
     spin_lock(&global_lock);
     shadow_kaddr = page_info->shadow_page;
+    should_switch = !page_info->dead &&
+                    page_info->state == WX_STATE_ORIGINAL;
     spin_unlock(&global_lock);
+    if (!should_switch) {
+        wxshadow_page_put(page_info);
+        return -1;
+    }
 
     /* Get VMA for page switching (lockless) */
     vma = kfunc_find_vma(mm, addr);
@@ -106,6 +123,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
 {
     unsigned long far = (unsigned long)args->arg0;
     unsigned int esr = (unsigned int)(unsigned long)args->arg1;
+    enum wxshadow_fault_access access;
     void *mm;
     struct wxshadow_page *page;
 
@@ -113,8 +131,8 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
     if (!mm)
         return;
 
-    /* Only handle permission faults, not translation faults */
-    if (!is_permission_fault(esr)) {
+    access = wxshadow_classify_permission_fault(esr);
+    if (access == WXSHADOW_FAULT_NONE) {
         kfunc_mmput(mm);
         return;
     }
@@ -126,7 +144,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
         return;
     }
 
-    if (is_el0_instruction_abort(esr)) {
+    if (access == WXSHADOW_FAULT_EXEC) {
         /* Instruction fetch fault - switch to shadow page */
         if (wxshadow_handle_exec_fault(mm, far) == 0) {
             args->ret = 0;
@@ -135,7 +153,7 @@ static void do_page_fault_before_impl(hook_fargs3_t *args, void *udata)
             kfunc_mmput(mm);
             return;
         }
-    } else if (!is_write_abort(esr)) {
+    } else if (access == WXSHADOW_FAULT_READ) {
         /* Read fault - switch to original page */
         if (wxshadow_handle_read_fault(mm, far) == 0) {
             args->ret = 0;
@@ -169,8 +187,9 @@ void do_page_fault_before(hook_fargs3_t *args, void *udata)
  * follow_page_pte to resolve a user PTE to a struct page.  This bypasses
  * user-space page faults entirely.
  *
- * Strategy: In the before hook, temporarily swap the PTE from shadow to
- * original so follow_page_pte reads the original PFN.  In the after hook,
+ * Strategy: In the before hook, temporarily swap the PTE from shadow to the
+ * live original page so follow_page_pte reads the current original PFN.
+ * In the after hook,
  * swap it back.  We do NOT flush TLB, so the target process's execution
  * (which uses cached TLB entries pointing to shadow) is unaffected.
  *
@@ -211,6 +230,15 @@ static void follow_page_pte_before_impl(hook_fargs5_t *args, void *udata)
     page = wxshadow_find_page(mm, address);  /* takes ref */
     if (!page)
         return;
+
+    spin_lock(&global_lock);
+    if (page->dead || page->state != WX_STATE_SHADOW_X ||
+        page->logical_release_pending) {
+        spin_unlock(&global_lock);
+        wxshadow_page_put(page);
+        return;
+    }
+    spin_unlock(&global_lock);
 
     if (wxshadow_page_begin_gup_hide(page, mm, page->page_addr, &ptep,
                                      &orig_pte) != 0) {
@@ -282,8 +310,8 @@ static void exit_mmap_before_impl(hook_fargs1_t *args, void *udata)
 
     nr = wxshadow_teardown_pages_for_mm(mm, "exit_mmap");
     if (nr > 0)
-        pr_info("wxshadow: [exit_mmap] cleanup complete for mm=%px (%d pages)\n",
-                mm, nr);
+        pr_info("wxshadow: [exit_mmap] cleaned %d pages for mm=%px\n",
+                nr, mm);
 }
 
 void exit_mmap_before(hook_fargs1_t *args, void *udata)
@@ -296,9 +324,8 @@ void exit_mmap_before(hook_fargs1_t *args, void *udata)
 /* ========== Fork protection handler ========== */
 
 /*
- * Max shadow pages to fix per fork.  Stack array avoids allocation in
- * the after-copy_process callback (which runs with preemption disabled
- * on some kernels).
+ * Max shadow pages to pause/resume per fork pass. Stack array avoids
+ * allocation in the copy_process callbacks.
  */
 #define FORK_FIX_BATCH  32
 
@@ -308,30 +335,56 @@ struct fork_fix_entry {
 };
 
 /*
- * wxshadow_fix_child_ptes - restore child's PTEs to original pages.
+ * copy_process snapshots the parent's page tables before the child runs.
+ * If the parent still has shadow PFNs installed, the child inherits them
+ * and the kernel accounts those private shadow pages during fork.  Rewriting
+ * the child PTEs afterwards leaves fork-time RSS/rmap accounting attached to
+ * the shadow PFN and later teardown trips Bad rss-counter / Bad page map.
  *
- * After fork(), the child inherits the parent's page tables including any
- * shadow PTEs (--x pointing to shadow pages).  Since wxshadow only tracks
- * the parent's mm, the child would trigger unhandled BRKs or permission
- * faults.  This function walks the parent's shadow page list and rewrites
- * each corresponding PTE in the child's mm to point to the original page
- * with r-x permissions.
+ * To avoid that, pause the parent's live shadow mappings before copy_process
+ * clones the mm, then reactivate them afterwards in the parent only.
  */
-static void wxshadow_fix_child_ptes(void *parent_mm, void *child_mm)
+static bool wxshadow_page_has_active_mods_locked(struct wxshadow_page *page)
+{
+    int i;
+
+    if (!page)
+        return false;
+
+    for (i = 0; i < page->nr_bps; i++) {
+        if (page->bps[i].active)
+            return true;
+    }
+
+    for (i = 0; i < page->nr_patches; i++) {
+        if (page->patches[i].active)
+            return true;
+    }
+
+    return false;
+}
+
+static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
 {
     struct fork_fix_entry batch[FORK_FIX_BATCH];
-    int nr, i;
+    int nr, i, progress;
     struct list_head *pos;
 
     do {
         nr = 0;
+        progress = 0;
 
         /* Collect a batch of pages under lock */
         spin_lock(&global_lock);
         list_for_each(pos, &page_list) {
             struct wxshadow_page *p =
                 container_of(pos, struct wxshadow_page, list);
-            if (p->mm == parent_mm && !p->dead && p->pfn_original) {
+            if (p->mm == parent_mm && !p->dead &&
+                p->state == WX_STATE_SHADOW_X &&
+                !p->fork_paused &&
+                !p->release_pending &&
+                !p->logical_release_pending &&
+                p->pfn_original && p->pfn_shadow) {
                 p->refcount++;
                 batch[nr].page = p;
                 batch[nr].page_addr = p->page_addr;
@@ -344,57 +397,172 @@ static void wxshadow_fix_child_ptes(void *parent_mm, void *child_mm)
         if (nr == 0)
             break;
 
-        /* Fix each collected PTE in the child's mm (outside lock) */
+        /* Pause each collected parent mapping outside the global lock. */
         for (i = 0; i < nr; i++) {
-            wxshadow_page_pte_lock(batch[i].page);
-            wxshadow_page_restore_child_original_locked(batch[i].page, child_mm,
-                                                        batch[i].page_addr);
-            wxshadow_page_pte_unlock(batch[i].page);
+            struct wxshadow_page *page = batch[i].page;
+            void *vma;
+            int ret = -1;
+
+            wxshadow_page_pte_lock(page);
+
+            spin_lock(&global_lock);
+            if (!page->dead &&
+                page->state == WX_STATE_SHADOW_X &&
+                !page->fork_paused &&
+                !page->release_pending &&
+                !page->logical_release_pending) {
+                spin_unlock(&global_lock);
+
+                vma = kfunc_find_vma ? kfunc_find_vma(parent_mm, batch[i].page_addr) : NULL;
+                if (vma && vma_start(vma) <= batch[i].page_addr) {
+                    ret = wxshadow_page_enter_dormant_locked(page, vma,
+                                                             batch[i].page_addr);
+                    if (ret == 0) {
+                        spin_lock(&global_lock);
+                        if (!page->dead && page->state == WX_STATE_DORMANT)
+                            page->fork_paused = true;
+                        spin_unlock(&global_lock);
+                        progress++;
+                    }
+                }
+            } else {
+                spin_unlock(&global_lock);
+            }
+
+            if (ret != 0) {
+                pr_warn("wxshadow: [fork] pause failed for addr=%lx mm=%px: %d\n",
+                        batch[i].page_addr, parent_mm, ret);
+            }
+
+            wxshadow_page_pte_unlock(page);
             wxshadow_page_put(batch[i].page);
         }
 
-        pr_info("wxshadow: [fork] fixed %d child PTEs (parent_mm=%px child_mm=%px)\n",
-                nr, parent_mm, child_mm);
+        if (progress > 0) {
+            pr_info("wxshadow: [fork] paused %d parent shadow PTEs (mm=%px)\n",
+                    progress, parent_mm);
+        }
 
-    } while (nr == FORK_FIX_BATCH);  /* Loop if batch was full (more pages) */
+        if (progress == 0)
+            break;
+
+    } while (nr == FORK_FIX_BATCH);
 }
 
-static void wxshadow_handle_fork(struct task_struct *new_task)
+static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
+{
+    struct fork_fix_entry batch[FORK_FIX_BATCH];
+    int nr, i, progress;
+    struct list_head *pos;
+
+    do {
+        nr = 0;
+        progress = 0;
+
+        spin_lock(&global_lock);
+        list_for_each(pos, &page_list) {
+            struct wxshadow_page *p =
+                container_of(pos, struct wxshadow_page, list);
+            if (p->mm == parent_mm && !p->dead && p->fork_paused &&
+                p->state == WX_STATE_DORMANT &&
+                p->pfn_original && p->pfn_shadow &&
+                wxshadow_page_has_active_mods_locked(p)) {
+                p->refcount++;
+                batch[nr].page = p;
+                batch[nr].page_addr = p->page_addr;
+                if (++nr >= FORK_FIX_BATCH)
+                    break;
+            }
+        }
+        spin_unlock(&global_lock);
+
+        if (nr == 0)
+            break;
+
+        for (i = 0; i < nr; i++) {
+            struct wxshadow_page *page = batch[i].page;
+            void *vma;
+            int ret = -1;
+
+            wxshadow_page_pte_lock(page);
+
+            spin_lock(&global_lock);
+            if (!page->dead && page->fork_paused &&
+                page->state == WX_STATE_DORMANT &&
+                page->pfn_shadow &&
+                wxshadow_page_has_active_mods_locked(page)) {
+                spin_unlock(&global_lock);
+
+                vma = kfunc_find_vma ? kfunc_find_vma(parent_mm, batch[i].page_addr) : NULL;
+                if (vma && vma_start(vma) <= batch[i].page_addr) {
+                    ret = wxshadow_page_activate_shadow_locked(page, vma,
+                                                               batch[i].page_addr);
+                    if (ret == 0) {
+                        spin_lock(&global_lock);
+                        if (!page->dead && page->state == WX_STATE_SHADOW_X)
+                            page->fork_paused = false;
+                        spin_unlock(&global_lock);
+                        progress++;
+                    }
+                }
+            } else {
+                if (!page->dead && page->fork_paused &&
+                    (!page->pfn_shadow ||
+                     !wxshadow_page_has_active_mods_locked(page))) {
+                    page->fork_paused = false;
+                }
+                spin_unlock(&global_lock);
+            }
+
+            if (ret != 0) {
+                pr_warn("wxshadow: [fork] resume failed for addr=%lx mm=%px: %d\n",
+                        batch[i].page_addr, parent_mm, ret);
+            }
+
+            wxshadow_page_pte_unlock(page);
+            wxshadow_page_put(page);
+        }
+
+        if (progress > 0) {
+            pr_info("wxshadow: [fork] resumed %d parent shadow PTEs (mm=%px)\n",
+                    progress, parent_mm);
+        }
+
+        if (progress == 0)
+            break;
+
+    } while (nr == FORK_FIX_BATCH);
+}
+
+void before_copy_process_wx(hook_fargs8_t *args, void *udata)
 {
     void *parent_mm;
-    void *child_mm = NULL;
 
+    (void)args;
+    (void)udata;
+
+    WX_HANDLER_ENTER();
     parent_mm = kfunc_get_task_mm(current);
-    if (!parent_mm)
-        return;
-
-    if (task_struct_offset.mm_offset >= 0)
-        safe_read_ptr((unsigned long)new_task + task_struct_offset.mm_offset, &child_mm);
-
-    if (!child_mm || child_mm == parent_mm) {
+    if (parent_mm) {
+        wxshadow_pause_parent_shadow_pages(parent_mm);
         kfunc_mmput(parent_mm);
-        return;
     }
-
-    wxshadow_fix_child_ptes(parent_mm, child_mm);
-    kfunc_mmput(parent_mm);
+    WX_HANDLER_EXIT();
 }
 
 void after_copy_process_wx(hook_fargs8_t *args, void *udata)
 {
-    struct task_struct *new_task = (struct task_struct *)args->ret;
+    void *parent_mm;
+
+    (void)args;
+    (void)udata;
 
     WX_HANDLER_ENTER();
-    if (new_task && !IS_ERR(new_task))
-        wxshadow_handle_fork(new_task);
-    WX_HANDLER_EXIT();
-}
-
-void after_cgroup_post_fork_wx(hook_fargs4_t *args, void *udata)
-{
-    WX_HANDLER_ENTER();
-    if (args->arg0)
-        wxshadow_handle_fork((struct task_struct *)args->arg0);
+    parent_mm = kfunc_get_task_mm(current);
+    if (parent_mm) {
+        wxshadow_resume_parent_shadow_pages(parent_mm);
+        kfunc_mmput(parent_mm);
+    }
     WX_HANDLER_EXIT();
 }
 
@@ -531,6 +699,14 @@ static bool wxshadow_can_resume_stale_brk(void *mm, unsigned long pc)
     return insn != WXSHADOW_BRK_INSN;
 }
 
+static void wxshadow_brk_inflight_put(struct wxshadow_page *page_info)
+{
+    spin_lock(&global_lock);
+    if (page_info->brk_in_flight > 0)
+        page_info->brk_in_flight--;
+    spin_unlock(&global_lock);
+}
+
 /* BRK handler implementation (called with in-flight counter already incremented) */
 static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
 {
@@ -572,11 +748,13 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
         kfunc_mmput(mm);
         return DBG_HOOK_ERROR;
     }
+    page_info->brk_in_flight++;
     spin_unlock(&global_lock);
 
     /* Get VMA (lockless) */
     vma = kfunc_find_vma(mm, pc);
     if (!vma || vma_start(vma) > pc) {
+        wxshadow_brk_inflight_put(page_info);
         wxshadow_teardown_page(page_info, "VMA Gone (BRK handler)");
         wxshadow_page_put(page_info);
         kfunc_mmput(mm);
@@ -584,6 +762,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     }
 
     if (!wxshadow_validate_page_mapping(mm, vma, page_info, page_addr)) {
+        wxshadow_brk_inflight_put(page_info);
         wxshadow_teardown_page(page_info, "Mapping Changed (BRK handler)");
         wxshadow_page_put(page_info);
         kfunc_mmput(mm);
@@ -593,6 +772,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
     bp = wxshadow_find_bp(page_info, pc);
     ret = wxshadow_page_begin_stepping(page_info, vma, page_addr, current);
     if (ret != 0) {
+        wxshadow_brk_inflight_put(page_info);
         wxshadow_page_put(page_info);
         kfunc_mmput(mm);
         if (ret == -16) {
@@ -602,6 +782,7 @@ static int wxshadow_brk_handler_impl(struct pt_regs *regs, unsigned int esr)
         }
         return DBG_HOOK_ERROR;
     }
+    wxshadow_brk_inflight_put(page_info);
 
     wxshadow_print_regs(regs, pc);
 
