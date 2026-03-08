@@ -175,7 +175,9 @@ extern void *kfunc_do_page_fault;
 /* follow_page_pte hook (GUP hiding) */
 extern void *kfunc_follow_page_pte;
 
-/* copy_process hook (fork protection) */
+/* fork protection hooks */
+extern void *kfunc_dup_mmap;
+extern void *kfunc_uprobe_dup_mmap;
 extern void *kfunc_copy_process;
 extern void *kfunc_cgroup_post_fork;
 
@@ -559,6 +561,10 @@ int wxshadow_page_enter_dormant_locked(struct wxshadow_page *page, void *vma,
 
 /* ========== Fork handler (wxshadow_handlers.c) ========== */
 
+void before_dup_mmap_wx(hook_fargs2_t *args, void *udata);
+void after_dup_mmap_wx(hook_fargs2_t *args, void *udata);
+void before_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata);
+void after_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata);
 void before_copy_process_wx(hook_fargs8_t *args, void *udata);
 void after_copy_process_wx(hook_fargs8_t *args, void *udata);
 

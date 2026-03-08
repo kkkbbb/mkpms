@@ -409,6 +409,21 @@ int resolve_symbols(void)
         pr_warn("wxshadow: follow_page_pte not found, GUP hiding disabled\n");
     }
 
+    /* dup_mmap for precise fork protection (real mm duplication only) */
+    kfunc_dup_mmap = (void *)lookup_name_safe("dup_mmap");
+    if (kfunc_dup_mmap) {
+        pr_info("wxshadow: dup_mmap found at %px\n", kfunc_dup_mmap);
+    } else {
+        pr_warn("wxshadow: dup_mmap not found, trying uprobe_dup_mmap\n");
+    }
+
+    kfunc_uprobe_dup_mmap = (void *)lookup_name_safe("uprobe_dup_mmap");
+    if (kfunc_uprobe_dup_mmap) {
+        pr_info("wxshadow: uprobe_dup_mmap found at %px\n", kfunc_uprobe_dup_mmap);
+    } else {
+        pr_warn("wxshadow: uprobe_dup_mmap not found\n");
+    }
+
     /* init_task already resolved above via kallsyms */
 
     pr_info("wxshadow: all symbols resolved successfully\n");

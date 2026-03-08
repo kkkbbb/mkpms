@@ -9,6 +9,10 @@
 
 #include "wxshadow_internal.h"
 
+#ifndef CLONE_VM
+#define CLONE_VM 0x00000100
+#endif
+
 /* ========== Read/Exec Fault handlers ========== */
 
 /*
@@ -344,6 +348,15 @@ struct fork_fix_entry {
  * To avoid that, pause the parent's live shadow mappings before copy_process
  * clones the mm, then reactivate them afterwards in the parent only.
  */
+static bool wxshadow_copy_process_needs_fork_fix(unsigned long clone_flags)
+{
+    /*
+     * CLONE_VM shares the caller's mm, so there is no duplicated page-table
+     * snapshot to sanitize. Restrict fork protection to real mm-copy forks.
+     */
+    return !(clone_flags & CLONE_VM);
+}
+
 static bool wxshadow_page_has_active_mods_locked(struct wxshadow_page *page)
 {
     int i;
@@ -367,7 +380,7 @@ static bool wxshadow_page_has_active_mods_locked(struct wxshadow_page *page)
 static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
 {
     struct fork_fix_entry batch[FORK_FIX_BATCH];
-    int nr, i, progress;
+    int nr, i, progress, total_progress = 0;
     struct list_head *pos;
 
     do {
@@ -423,6 +436,7 @@ static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
                             page->fork_paused = true;
                         spin_unlock(&global_lock);
                         progress++;
+                        total_progress++;
                     }
                 }
             } else {
@@ -438,21 +452,21 @@ static void wxshadow_pause_parent_shadow_pages(void *parent_mm)
             wxshadow_page_put(batch[i].page);
         }
 
-        if (progress > 0) {
-            pr_info("wxshadow: [fork] paused %d parent shadow PTEs (mm=%px)\n",
-                    progress, parent_mm);
-        }
-
         if (progress == 0)
             break;
 
     } while (nr == FORK_FIX_BATCH);
+
+    if (total_progress > 0) {
+        pr_info("wxshadow: [fork] paused %d parent shadow PTEs (mm=%px)\n",
+                total_progress, parent_mm);
+    }
 }
 
 static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
 {
     struct fork_fix_entry batch[FORK_FIX_BATCH];
-    int nr, i, progress;
+    int nr, i, progress, total_progress = 0;
     struct list_head *pos;
 
     do {
@@ -503,6 +517,7 @@ static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
                             page->fork_paused = false;
                         spin_unlock(&global_lock);
                         progress++;
+                        total_progress++;
                     }
                 }
             } else {
@@ -523,25 +538,100 @@ static void wxshadow_resume_parent_shadow_pages(void *parent_mm)
             wxshadow_page_put(page);
         }
 
-        if (progress > 0) {
-            pr_info("wxshadow: [fork] resumed %d parent shadow PTEs (mm=%px)\n",
-                    progress, parent_mm);
-        }
-
         if (progress == 0)
             break;
 
     } while (nr == FORK_FIX_BATCH);
+
+    if (total_progress > 0) {
+        pr_info("wxshadow: [fork] resumed %d parent shadow PTEs (mm=%px)\n",
+                total_progress, parent_mm);
+    }
+}
+
+void before_dup_mmap_wx(hook_fargs2_t *args, void *udata)
+{
+    void *oldmm = (void *)args->arg1;
+
+    (void)udata;
+
+    WX_HANDLER_ENTER();
+    args->local.data0 = 0;
+    if (!oldmm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
+    args->local.data0 = 1;
+    wxshadow_pause_parent_shadow_pages(oldmm);
+    WX_HANDLER_EXIT();
+}
+
+void after_dup_mmap_wx(hook_fargs2_t *args, void *udata)
+{
+    void *oldmm = (void *)args->arg1;
+
+    (void)udata;
+
+    WX_HANDLER_ENTER();
+    if (!args->local.data0 || !oldmm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
+    wxshadow_resume_parent_shadow_pages(oldmm);
+    WX_HANDLER_EXIT();
+}
+
+void before_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata)
+{
+    void *oldmm = (void *)args->arg0;
+
+    (void)udata;
+
+    WX_HANDLER_ENTER();
+    args->local.data0 = 0;
+    if (!oldmm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
+    args->local.data0 = 1;
+    wxshadow_pause_parent_shadow_pages(oldmm);
+    WX_HANDLER_EXIT();
+}
+
+void after_uprobe_dup_mmap_wx(hook_fargs2_t *args, void *udata)
+{
+    void *oldmm = (void *)args->arg0;
+
+    (void)udata;
+
+    WX_HANDLER_ENTER();
+    if (!args->local.data0 || !oldmm) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
+    wxshadow_resume_parent_shadow_pages(oldmm);
+    WX_HANDLER_EXIT();
 }
 
 void before_copy_process_wx(hook_fargs8_t *args, void *udata)
 {
     void *parent_mm;
+    unsigned long clone_flags = (unsigned long)args->arg0;
 
-    (void)args;
     (void)udata;
 
     WX_HANDLER_ENTER();
+    args->local.data0 = 0;
+    if (!wxshadow_copy_process_needs_fork_fix(clone_flags)) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
+    args->local.data0 = 1;
     parent_mm = kfunc_get_task_mm(current);
     if (parent_mm) {
         wxshadow_pause_parent_shadow_pages(parent_mm);
@@ -554,10 +644,14 @@ void after_copy_process_wx(hook_fargs8_t *args, void *udata)
 {
     void *parent_mm;
 
-    (void)args;
     (void)udata;
 
     WX_HANDLER_ENTER();
+    if (!args->local.data0) {
+        WX_HANDLER_EXIT();
+        return;
+    }
+
     parent_mm = kfunc_get_task_mm(current);
     if (parent_mm) {
         wxshadow_resume_parent_shadow_pages(parent_mm);

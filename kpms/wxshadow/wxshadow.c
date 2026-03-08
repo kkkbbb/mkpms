@@ -105,7 +105,9 @@ void *kfunc_do_page_fault = NULL;
 /* follow_page_pte hook (GUP hiding for /proc/pid/mem etc.) */
 void *kfunc_follow_page_pte = NULL;
 
-/* copy_process hook (fork protection) */
+/* fork protection hooks */
+void *kfunc_dup_mmap = NULL;
+void *kfunc_uprobe_dup_mmap = NULL;
 void *kfunc_copy_process = NULL;
 void *kfunc_cgroup_post_fork = NULL;
 
@@ -1495,27 +1497,33 @@ static long wxshadow_init(const char *args, const char *event, void *__user rese
         }
     }
 
-    /* Hook copy_process for fork protection (optional) */
-    if (patch_config) {
-        unsigned long cp_addr = patch_config->copy_process;
-        if (cp_addr) {
-            kfunc_copy_process = (void *)cp_addr;
-            ret = hook_wrap8(kfunc_copy_process,
-                             before_copy_process_wx,
-                             after_copy_process_wx, NULL);
-            if (ret != HOOK_NO_ERR) {
-                pr_warn("wxshadow: failed to hook copy_process: %d\n", ret);
-                kfunc_copy_process = NULL;
-            } else {
-                pr_info("wxshadow: hooked copy_process at %px for fork protection\n",
-                        kfunc_copy_process);
-            }
+    /* Hook fork protection only on precise mm-duplication callbacks. */
+    if (kfunc_dup_mmap) {
+        ret = hook_wrap2(kfunc_dup_mmap,
+                         before_dup_mmap_wx,
+                         after_dup_mmap_wx, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_warn("wxshadow: failed to hook dup_mmap: %d\n", ret);
+            kfunc_dup_mmap = NULL;
+        } else {
+            pr_info("wxshadow: hooked dup_mmap at %px for fork protection\n",
+                    kfunc_dup_mmap);
         }
-        if (!kfunc_copy_process) {
-            pr_warn("wxshadow: fork protection DISABLED (copy_process hook unavailable; post-fork child PTE rewrite is unsafe)\n");
+    }
+    if (!kfunc_dup_mmap && kfunc_uprobe_dup_mmap) {
+        ret = hook_wrap2(kfunc_uprobe_dup_mmap,
+                         before_uprobe_dup_mmap_wx,
+                         after_uprobe_dup_mmap_wx, NULL);
+        if (ret != HOOK_NO_ERR) {
+            pr_warn("wxshadow: failed to hook uprobe_dup_mmap: %d\n", ret);
+            kfunc_uprobe_dup_mmap = NULL;
+        } else {
+            pr_info("wxshadow: hooked uprobe_dup_mmap at %px for fork protection\n",
+                    kfunc_uprobe_dup_mmap);
         }
-    } else {
-        pr_warn("wxshadow: patch_config not available, fork protection DISABLED\n");
+    }
+    if (!kfunc_dup_mmap && !kfunc_uprobe_dup_mmap) {
+        pr_warn("wxshadow: fork protection DISABLED (precise dup_mmap hooks unavailable; copy_process fallback intentionally disabled because it is too broad)\n");
     }
 
     pr_info("wxshadow: W^X shadow memory module loaded\n");
@@ -1608,14 +1616,21 @@ static long wxshadow_exit(void *__user reserved)
     page_count = wxshadow_teardown_pages_for_mm(NULL, "module unload");
 
     /*
-     * Phase 2.5: Unhook fork protection (copy_process).
+     * Phase 2.5: Unhook fork protection.
      * Must be done before BRK/step unhook — fork handler may reference
      * shadow pages, but page_list is already empty so it will be a no-op.
      */
-    if (kfunc_copy_process) {
-        hook_unwrap(kfunc_copy_process, before_copy_process_wx, after_copy_process_wx);
-        pr_info("wxshadow: unhooked copy_process (phase 2.5)\n");
-        wait_for_handlers_drain("phase2.5-copy_process");
+    if (kfunc_dup_mmap) {
+        hook_unwrap(kfunc_dup_mmap, before_dup_mmap_wx, after_dup_mmap_wx);
+        pr_info("wxshadow: unhooked dup_mmap (phase 2.5)\n");
+        wait_for_handlers_drain("phase2.5-dup_mmap");
+    }
+    if (kfunc_uprobe_dup_mmap) {
+        hook_unwrap(kfunc_uprobe_dup_mmap,
+                    before_uprobe_dup_mmap_wx,
+                    after_uprobe_dup_mmap_wx);
+        pr_info("wxshadow: unhooked uprobe_dup_mmap (phase 2.5)\n");
+        wait_for_handlers_drain("phase2.5-uprobe_dup_mmap");
     }
 
     /*
