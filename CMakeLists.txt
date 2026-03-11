@@ -7,8 +7,12 @@ if(NOT DEFINED KP_DIR)
     set(KP_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 endif()
 
-# 设置全局编译选项
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -O2")
+# 默认使用无调试信息的 Release 构建。
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+set(CMAKE_C_FLAGS_RELEASE "-DNDEBUG -g0" CACHE STRING "Release flags" FORCE)
+set(CMAKE_C_FLAGS_RELWITHDEBINFO "-DNDEBUG -g0" CACHE STRING "RelWithDebInfo flags" FORCE)
 
 # 设置全局包含目录
 set(KERNEL_INCLUDE_DIRS
@@ -51,6 +55,7 @@ function(add_kpm_module MODULE_NAME)
 
     # 设置编译选项
     target_compile_options(${MODULE_NAME}_obj PRIVATE
+        -Os
         -fno-stack-protector
         -fno-builtin
         -nostdinc
@@ -95,7 +100,5 @@ foreach(child ${CHILD_MODULES})
         add_subdirectory(kpms/${child})
     endif()
 endforeach()
-
-
 
 

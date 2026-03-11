@@ -8,5 +8,4 @@ add_kpm_module(wxshadow
 
 # Build client tool (userspace)
 add_executable(wxshadow_client wxshadow_client.c)
-target_compile_options(wxshadow_client PRIVATE -O2 -static)
-target_link_options(wxshadow_client PRIVATE -static)
+target_link_options(wxshadow_client PRIVATE -static -s)

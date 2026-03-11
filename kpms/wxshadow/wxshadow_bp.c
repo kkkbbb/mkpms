@@ -742,51 +742,18 @@ static int wxshadow_wait_for_release_brk_handlers(struct wxshadow_page *page_inf
     return -16;
 }
 
-static int wxshadow_find_release_vma(struct wxshadow_page *page_info,
-                                     const char *reason,
-                                     void **out_vma)
-{
-    void *mm;
-    void *vma;
-    u64 probe;
-
-    if (!page_info || !out_vma)
-        return -22;
-
-    mm = page_info->mm;
-    if (!mm || !page_info->pfn_original || !kfunc_find_vma)
-        return -14;
-
-    if (!is_kva((unsigned long)mm) ||
-        !safe_read_u64((unsigned long)mm, &probe))
-        return -14;
-
-    vma = kfunc_find_vma(mm, page_info->page_addr);
-    if (!vma || vma_start(vma) > page_info->page_addr) {
-        pr_warn("wxshadow: [%s] no vma for addr=%lx\n",
-                reason, page_info->page_addr);
-        return -14;
-    }
-
-    *out_vma = vma;
-    return 0;
-}
-
 static int wxshadow_release_mod_at_addr(struct wxshadow_page *page_info,
                                         unsigned long addr,
                                         unsigned int match_flags,
                                         const char *reason)
 {
     void *free_patch_data[WXSHADOW_MAX_PATCHES_PER_PAGE];
-    enum wxshadow_state initial_state = WX_STATE_NONE;
     unsigned long offset = addr & ~PAGE_MASK;
     unsigned long range_start = PAGE_SIZE;
     unsigned long range_end = 0;
     bool wait_brk_handlers = false;
     bool matched = false;
     bool has_remaining;
-    bool should_reactivate = false;
-    void *vma = NULL;
     int nr_free = 0;
     int ret = 0;
     int i;
@@ -817,32 +784,7 @@ retry:
         }
         goto retry;
     }
-    initial_state = page_info->state;
     page_info->logical_release_pending = true;
-    spin_unlock(&global_lock);
-
-    if (initial_state != WX_STATE_DORMANT && initial_state != WX_STATE_NONE) {
-        ret = wxshadow_find_release_vma(page_info, reason, &vma);
-        if (ret < 0)
-            goto out_fail_locked;
-
-        ret = wxshadow_page_enter_dormant_locked(page_info, vma,
-                                                 page_info->page_addr);
-        if (ret < 0)
-            goto out_fail_locked;
-    }
-
-    wxshadow_page_pte_unlock(page_info);
-
-    wxshadow_sync_shadow_exec_zero(page_info, reason);
-
-    ret = wxshadow_wait_for_release_brk_handlers(page_info, reason);
-    if (ret < 0)
-        goto out_fail_unlocked;
-
-    wxshadow_page_pte_lock(page_info);
-
-    spin_lock(&global_lock);
     if (page_info->dead || !page_info->shadow_page) {
         spin_unlock(&global_lock);
         wxshadow_page_pte_unlock(page_info);
@@ -898,9 +840,6 @@ retry:
     }
 
     has_remaining = wxshadow_page_has_active_mods_locked(page_info);
-    should_reactivate = has_remaining &&
-                        initial_state != WX_STATE_DORMANT &&
-                        initial_state != WX_STATE_NONE;
     spin_unlock(&global_lock);
 
     if (!matched) {
@@ -913,22 +852,11 @@ retry:
 
     wxshadow_sync_page_tracking(page_info);
 
-    if (has_remaining) {
+    if (range_start < range_end) {
         ret = wxshadow_rebuild_shadow_range(page_info, range_start,
                                             range_end - range_start);
-        if (ret == 0 && should_reactivate) {
-            ret = wxshadow_find_release_vma(page_info, reason, &vma);
-            if (ret == 0) {
-                wxshadow_clear_logical_release_pending(page_info);
-                ret = wxshadow_page_activate_shadow_locked(page_info, vma,
-                                                           page_info->page_addr);
-            }
-        } else {
-            wxshadow_clear_logical_release_pending(page_info);
-        }
-    } else {
-        wxshadow_clear_logical_release_pending(page_info);
     }
+    wxshadow_clear_logical_release_pending(page_info);
 
     wxshadow_page_pte_unlock(page_info);
 
@@ -936,6 +864,9 @@ retry:
         kfunc_kfree(free_patch_data[i]);
 
     if (ret < 0) {
+        /* Rebuild failed after metadata changed; retire the page instead of
+         * leaving a stale shadow mapping visible to future execution. */
+        (void)wxshadow_teardown_page(page_info, reason);
         return ret;
     }
 
@@ -946,15 +877,6 @@ retry:
     }
 
     return 0;
-
-out_fail_locked:
-    wxshadow_clear_logical_release_pending(page_info);
-    wxshadow_page_pte_unlock(page_info);
-    return ret;
-
-out_fail_unlocked:
-    wxshadow_clear_logical_release_pending(page_info);
-    return ret;
 }
 
 /* ========== Set breakpoint ========== */
