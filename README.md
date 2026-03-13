@@ -11,9 +11,9 @@ git config submodule.recurse true 自动更新submodule
 
 <img width="585" height="789" alt="d3d3b72fbf1c8d493d2098417def85f2" src="https://github.com/user-attachments/assets/e7be1d78-5d66-4ba7-8dfc-41c8c1f568a3" />
 
-#更新
-配合rustfrida实现java、native hook
-https://bbs.kanxue.com/thread-290304.htm#msg_header_h2_5
+# 更新
+* 配合rustfrida实现java、native hook
+* https://bbs.kanxue.com/thread-290304.htm#msg_header_h2_5
 ## 交流群
 
 ![wxshadow 微信群](image.png)
