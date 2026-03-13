@@ -17,3 +17,11 @@ git config submodule.recurse true 自动更新submodule
 ## 交流群
 
 ![wxshadow 微信群](image.png)
+
+## License
+
+This project is licensed under the [GPL v3](LICENSE). Any derivative work that uses, modifies, or distributes this project's code must be open-sourced under the same license.
+
+## 免责声明
+
+本项目仅供安全研究与学习交流使用，**严禁用于任何非法用途**。使用者应遵守所在地区的法律法规，因使用本项目产生的一切后果由使用者自行承担，与项目作者无关。
