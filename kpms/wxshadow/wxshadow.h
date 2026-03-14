@@ -55,8 +55,8 @@ enum wxshadow_state {
 #define WXSHADOW_MAX_REG_MODS       4
 
 /* Maximum breakpoints per page */
-#define WXSHADOW_MAX_BPS_PER_PAGE   16
-#define WXSHADOW_MAX_PATCHES_PER_PAGE 32
+#define WXSHADOW_MAX_BPS_PER_PAGE   128
+#define WXSHADOW_MAX_PATCHES_PER_PAGE 128
 #define WXSHADOW_MAX_ACTIVE_MODS_PER_PAGE \
     (WXSHADOW_MAX_BPS_PER_PAGE + WXSHADOW_MAX_PATCHES_PER_PAGE)
 #define WXSHADOW_DIRTY_WORD_BITS    (sizeof(unsigned long) * 8)

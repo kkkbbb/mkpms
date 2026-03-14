@@ -571,7 +571,8 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
                                          unsigned long offset,
                                          unsigned long len)
 {
-    struct shadow_apply_op ops[WXSHADOW_MAX_ACTIVE_MODS_PER_PAGE];
+    struct shadow_apply_op *ops = NULL;
+    int nr_ops_max;
     unsigned long original_pfn;
     unsigned long shadow_vaddr;
     unsigned long page_addr;
@@ -588,9 +589,25 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
     if (offset >= PAGE_SIZE || offset + len > PAGE_SIZE)
         return -22;
 
+    /* Pre-read counts to size the ops array (allocated outside lock) */
     spin_lock(&global_lock);
     if (!page_info->shadow_page || !page_info->pfn_original) {
         spin_unlock(&global_lock);
+        return -14;
+    }
+    nr_ops_max = page_info->nr_patches + page_info->nr_bps;
+    spin_unlock(&global_lock);
+
+    if (nr_ops_max > 0) {
+        ops = safe_kcalloc(nr_ops_max, sizeof(*ops), 0xcc0);
+        if (!ops)
+            return -12;
+    }
+
+    spin_lock(&global_lock);
+    if (!page_info->shadow_page || !page_info->pfn_original) {
+        spin_unlock(&global_lock);
+        kfunc_kfree(ops);
         return -14;
     }
 
@@ -599,7 +616,7 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
     page_addr = page_info->page_addr;
     range_end = offset + len;
 
-    for (i = 0; i < page_info->nr_patches; i++) {
+    for (i = 0; i < page_info->nr_patches && nr_ops < nr_ops_max; i++) {
         struct wxshadow_patch *patch = &page_info->patches[i];
         unsigned long patch_end;
 
@@ -618,7 +635,7 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
         nr_ops++;
     }
 
-    for (i = 0; i < page_info->nr_bps; i++) {
+    for (i = 0; i < page_info->nr_bps && nr_ops < nr_ops_max; i++) {
         struct wxshadow_bp *bp = &page_info->bps[i];
         unsigned long bp_offset;
         unsigned long bp_end;
@@ -641,8 +658,10 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
     spin_unlock(&global_lock);
 
     original_kaddr = (const char *)pfn_to_kaddr(original_pfn);
-    if (!is_kva((unsigned long)original_kaddr))
+    if (!is_kva((unsigned long)original_kaddr)) {
+        kfunc_kfree(ops);
         return -14;
+    }
 
     memcpy((void *)(shadow_vaddr + offset),
            original_kaddr + offset, len);
@@ -681,6 +700,7 @@ static int wxshadow_rebuild_shadow_range(struct wxshadow_page *page_info,
 
     wxshadow_flush_kern_dcache_area(shadow_vaddr + offset, len);
     wxshadow_flush_icache_page(page_addr);
+    kfunc_kfree(ops);
     return 0;
 }
 

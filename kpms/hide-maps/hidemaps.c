@@ -47,9 +47,9 @@ void show_map_vma_after(hook_fargs2_t* args, void * udata){
     memcpy(line, m->buf + start, end - start);
     line[end - start] = 0;
 
-    char *pos = strstr(m->buf + start, "rwxp");
-    char *pos1 = strstr(m->buf + start, "wwb_so");
-    if ((pos && pos < m->buf + end) || (pos1 && pos1 < m->buf + end)) {
+    // char *pos = strstr(m->buf + start, "rwxp");
+    char *pos1 = strstr(m->buf + start, "wwb_");
+    if (pos1 && pos1 < m->buf + end) {
         // pos[1] = '-';  // rwxp -> r-xp
         m->count = start;
     }
