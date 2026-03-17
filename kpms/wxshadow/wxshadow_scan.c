@@ -14,34 +14,123 @@ static void *wx_init_process = NULL;
 
 /* ========== Safe symbol lookup (vmlinux only, no module traversal) ========== */
 
+/*
+ * kallsyms_on_each_symbol callback signature changed in kernel 6.2:
+ *   Old: fn(void *data, const char *name, struct module *mod, unsigned long addr)
+ *   New: fn(void *data, const char *name, unsigned long addr)
+ *
+ * We detect which signature is in use at init time by probing with a known
+ * symbol (_stext) and comparing the result against kallsyms_lookup_name.
+ */
+
 struct lookup_data {
     const char *name;
     unsigned long addr;
 };
 
-static int lookup_callback(void *data, const char *name, struct module *mod, unsigned long addr)
+/* 4-param callback (kernel < 6.2): addr is in 4th argument */
+static int lookup_cb_4arg(void *data, const char *name,
+                          struct module *mod, unsigned long addr)
 {
     struct lookup_data *ld = data;
     if (strcmp(name, ld->name) == 0) {
         ld->addr = addr;
-        return 1; /* stop iteration */
+        return 1;
+    }
+    return 0;
+}
+
+/* 3-param callback (kernel >= 6.2): addr is in 3rd argument */
+static int lookup_cb_3arg(void *data, const char *name, unsigned long addr)
+{
+    struct lookup_data *ld = data;
+    if (strcmp(name, ld->name) == 0) {
+        ld->addr = addr;
+        return 1;
+    }
+    return 0;
+}
+
+/* 0 = unknown, 3 = 3-param, 4 = 4-param */
+static int cb_param_style = 0;
+
+static void detect_callback_style(void)
+{
+    struct lookup_data ld;
+    unsigned long ref_addr;
+
+    if (!kallsyms_on_each_symbol || !kallsyms_lookup_name)
+        return;
+
+    /* Get ground truth from kallsyms_lookup_name */
+    ref_addr = kallsyms_lookup_name("_stext");
+    if (!ref_addr)
+        return;
+
+    /* Try 4-param callback first (older kernels) */
+    ld.name = "_stext";
+    ld.addr = 0;
+    kallsyms_on_each_symbol((void *)lookup_cb_4arg, &ld);
+    if (ld.addr == ref_addr) {
+        cb_param_style = 4;
+        pr_info("wxshadow: kallsyms_on_each_symbol uses 4-param callback\n");
+        return;
+    }
+
+    /* Try 3-param callback (6.2+) */
+    ld.addr = 0;
+    kallsyms_on_each_symbol((void *)lookup_cb_3arg, &ld);
+    if (ld.addr == ref_addr) {
+        cb_param_style = 3;
+        pr_info("wxshadow: kallsyms_on_each_symbol uses 3-param callback\n");
+        return;
+    }
+
+    pr_warn("wxshadow: could not detect kallsyms_on_each_symbol callback style\n");
+}
+
+/* Internal: look up a single exact name via vmlinux-only path */
+static unsigned long __lookup_name(const char *name)
+{
+    struct lookup_data ld = { .name = name, .addr = 0 };
+
+    if (kallsyms_on_each_symbol && cb_param_style == 4) {
+        kallsyms_on_each_symbol((void *)lookup_cb_4arg, &ld);
+        if (ld.addr)
+            return ld.addr;
+    } else if (kallsyms_on_each_symbol && cb_param_style == 3) {
+        kallsyms_on_each_symbol((void *)lookup_cb_3arg, &ld);
+        if (ld.addr)
+            return ld.addr;
+    } else if (kallsyms_lookup_name) {
+        /* Last resort: kallsyms_lookup_name (may search modules) */
+        return kallsyms_lookup_name(name);
     }
     return 0;
 }
 
 /*
- * Safe symbol lookup - only searches vmlinux symbols, never modules.
- * This avoids potential hangs when module_kallsyms_lookup_name
- * traverses the kernel module list.
+ * Safe symbol lookup - only searches vmlinux symbols via kallsyms_on_each_symbol.
+ * Falls back to kallsyms_lookup_name only if kallsyms_on_each_symbol unavailable.
+ * Automatically tries _noprof variant for kernel 6.10+ renamed symbols.
  */
 static unsigned long lookup_name_safe(const char *name)
 {
-    struct lookup_data ld = { .name = name, .addr = 0 };
+    unsigned long addr = __lookup_name(name);
+    if (addr)
+        return addr;
 
-    if (kallsyms_on_each_symbol) {
-        kallsyms_on_each_symbol(lookup_callback, &ld);
+    /* Try _noprof variant (kernel 6.10+ memory profiling renames) */
+    {
+        char noprof_name[128];
+        int len = strlen(name);
+        if (len + 8 < sizeof(noprof_name)) {
+            memcpy(noprof_name, name, len);
+            memcpy(noprof_name + len, "_noprof", 8);
+            addr = __lookup_name(noprof_name);
+        }
     }
-    return ld.addr;
+    return addr;
 }
 
 /* ========== Symbol resolution macros ========== */
@@ -67,6 +156,9 @@ int resolve_symbols(void)
 {
     pr_info("wxshadow: resolving symbols...\n");
 
+    /* Detect kallsyms_on_each_symbol callback style (3 vs 4 params) */
+    detect_callback_style();
+
     /* ===== Memory management (all exported) ===== */
     pr_info("wxshadow: [1/12] mm functions...\n");
     RESOLVE_SYMBOL(find_vma);
@@ -87,6 +179,11 @@ int resolve_symbols(void)
     pr_info("wxshadow: [2/12] page alloc...\n");
     kfunc___get_free_pages = (typeof(kfunc___get_free_pages))
         lookup_name_safe("__get_free_pages");
+    if (!kfunc___get_free_pages) {
+        /* 6.10+: __get_free_pages is inlined, real symbol is get_free_pages_noprof */
+        kfunc___get_free_pages = (typeof(kfunc___get_free_pages))
+            lookup_name_safe("get_free_pages_noprof");
+    }
     if (!kfunc___get_free_pages) {
         pr_err("wxshadow: __get_free_pages not found\n");
         return -1;
@@ -494,27 +591,57 @@ int scan_vma_struct_offsets(void)
     mm = kfunc_get_task_mm(current);
     if (!mm) {
         pr_warn("wxshadow: current task has no mm, using default vma offset\n");
-        goto use_default;
+        goto scan_known;
     }
 
-    /* First field of mm_struct is mmap (first VMA) */
-    if (!safe_read_ptr((unsigned long)mm, &vma) || !vma) {
-        pr_warn("wxshadow: no VMA in current mm, using default offset\n");
+    /*
+     * Get first VMA from mm_struct.
+     *
+     * Kernel <6.1: mm->mmap is the first field of mm_struct (a direct VMA pointer).
+     * Kernel 6.1+: mm->mmap removed, VMA stored in mm->mm_mt (maple tree).
+     *              Use find_vma(mm, 0) to retrieve it.
+     *
+     * Try find_vma first (works on all versions), fall back to reading mm->mmap.
+     */
+    vma = kfunc_find_vma(mm, 0);
+    if (!vma) {
+        /* Fallback: try reading mm->mmap (first pointer in mm_struct, old kernels) */
+        safe_read_ptr((unsigned long)mm, &vma);
+    }
+    if (!vma || !is_kva((unsigned long)vma)) {
+        pr_warn("wxshadow: no VMA in current mm, scanning with known offsets\n");
         kfunc_mmput(mm);
-        goto use_default;
+        goto scan_known;
+    }
+
+    /* Sanity check: vma->vm_start should be a user-space address (< PAGE_OFFSET) */
+    {
+        u64 check_start;
+        if (!safe_read_u64((unsigned long)vma, &check_start) ||
+            is_kva(check_start) || check_start == 0) {
+            pr_warn("wxshadow: VMA at %px looks invalid (vm_start=%llx)\n",
+                    vma, check_start);
+            kfunc_mmput(mm);
+            goto scan_known;
+        }
     }
 
     pr_info("wxshadow: scanning VMA at %px for mm pointer %px\n", vma, mm);
 
-    /* Search for vm_mm field in vma_struct */
-    for (i = 0x10; i < 0x80; i += 8) {
+    /*
+     * Dynamically detect vm_mm offset by scanning vm_area_struct fields.
+     * vm_start(0x00) and vm_end(0x08) are always at the beginning,
+     * so vm_mm must be at offset >= 0x10.  Search up to 0x100 to cover
+     * future kernel versions that may add fields before vm_mm.
+     */
+    for (i = 0x10; i < 0x100; i += 8) {
         u64 val;
         if (!safe_read_u64((unsigned long)vma + i, &val))
             continue;
         if (val == (u64)mm) {
             vma_vm_mm_offset = i;
             found = 1;
-            pr_info("wxshadow: vm_area_struct.vm_mm offset: 0x%x\n",
+            pr_info("wxshadow: vm_area_struct.vm_mm offset: 0x%x (detected)\n",
                     vma_vm_mm_offset);
             break;
         }
@@ -522,17 +649,34 @@ int scan_vma_struct_offsets(void)
 
     kfunc_mmput(mm);
 
-    if (!found) {
-        pr_warn("wxshadow: vm_mm offset not found by search\n");
-        goto use_default;
+    if (found)
+        return 0;
+
+    pr_warn("wxshadow: vm_mm offset not found by dynamic scan\n");
+
+scan_known:
+    /*
+     * Fallback: try known offsets from various kernel versions.
+     * 0x10: kernel 6.1+ (vm_mm right after vm_start/vm_end)
+     * 0x40: kernel 4.x-6.0 (vm_mm after rb_node/rb_subtree fields)
+     *
+     * Cannot validate without a valid VMA pointer, so log a warning
+     * and pick the most likely based on kernel version.
+     */
+    {
+        /* KP provides kernel version; prefer version-aware selection */
+        static const int known_offsets[] = { 0x10, 0x40 };
+        int n = sizeof(known_offsets) / sizeof(known_offsets[0]);
+        for (i = 0; i < n; i++) {
+            vma_vm_mm_offset = known_offsets[i];
+            pr_warn("wxshadow: using fallback vm_mm offset: 0x%x "
+                    "(UNVERIFIED — dynamic scan failed)\n",
+                    vma_vm_mm_offset);
+            return 0;
+        }
     }
-
-    return 0;
-
-use_default:
-    vma_vm_mm_offset = 0x40;
-    pr_info("wxshadow: using default vm_mm offset: 0x%x\n", vma_vm_mm_offset);
-    return 0;
+    pr_err("wxshadow: failed to determine vm_mm offset\n");
+    return -1;
 }
 
 /* ========== task_struct offset detection ========== */

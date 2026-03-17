@@ -1596,6 +1596,12 @@ static long wxshadow_exit(void *__user reserved)
 
     pr_info("wxshadow: unloading...\n");
 
+    /* If init never completed (hook_method still NONE), nothing to undo */
+    if (hook_method == WX_HOOK_METHOD_NONE) {
+        pr_info("wxshadow: init was never completed, nothing to clean up\n");
+        return 0;
+    }
+
     /*
      * Phase 1: Unhook prctl to block new user operations.
      * BRK/step/fault/exit_mmap hooks remain active throughout Phase 2
