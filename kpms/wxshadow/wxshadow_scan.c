@@ -356,6 +356,15 @@ int resolve_symbols(void)
         kfunc___flush_icache_range = (typeof(kfunc___flush_icache_range))
             lookup_name_safe("invalidate_icache_range");
     }
+    /* 6.1+ ARM64 renamed cache maintenance functions */
+    if (!kfunc___flush_icache_range) {
+        kfunc___flush_icache_range = (typeof(kfunc___flush_icache_range))
+            lookup_name_safe("caches_clean_inval_pou");
+    }
+    if (!kfunc___flush_icache_range) {
+        kfunc___flush_icache_range = (typeof(kfunc___flush_icache_range))
+            lookup_name_safe("caches_clean_inval_user_pou");
+    }
     if (kfunc___flush_icache_range) {
         pr_info("wxshadow: using kernel icache flush at %px\n", kfunc___flush_icache_range);
     } else {
