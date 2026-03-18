@@ -474,12 +474,9 @@ static inline void wxshadow_flush_kern_dcache_area(unsigned long kva, unsigned l
 
 static inline void wxshadow_flush_icache_range(unsigned long start, unsigned long end)
 {
-    if (kfunc___flush_icache_range) {
-        kfunc___flush_icache_range(start, end);
-        asm volatile("isb" : : : "memory");
-        return;
-    }
-    /* Fallback: global icache invalidate (dcache must already be clean) */
+    /* All callers pass user VA; dcache is already cleaned on the kernel VA
+     * via wxshadow_flush_kern_dcache_area().  Just do global icache invalidate. */
+    (void)start; (void)end;
     asm volatile("ic ialluis" : : : "memory");
     asm volatile("dsb ish" : : : "memory");
     asm volatile("isb" : : : "memory");
