@@ -595,6 +595,7 @@ void prctl_before(hook_fargs4_t *args, void *udata);
 int resolve_symbols(void);
 int scan_mm_struct_offsets(void);
 int scan_vma_struct_offsets(void);
+void lazy_scan_vma_struct_offsets(void* mm, void* vma);
 int detect_task_struct_offsets(void);
 int try_scan_mm_context_id_offset(void);
 void debug_print_tasks_list(int max_count);

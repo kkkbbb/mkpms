@@ -535,6 +535,47 @@ use_default:
     return 0;
 }
 
+/*
+ * Lazy verify/correct vma_vm_mm_offset.  The module-init scan may have
+ * fallen back to the hardcoded default (0x40) when:
+ *   - init ran in a kernel-thread context (current->mm == NULL), or
+ *   - the kernel uses a maple-tree mm_struct where mm->mmap is no longer
+ *     at offset 0 (Linux 6.1+), so safe_read_ptr returned NULL/0.
+ *
+ * On kernels with CONFIG_PER_VMA_LOCK the VMA struct gains two fields
+ * before the rb-tree/linked-list region, shifting vm_mm from 0x40 to
+ * 0x50.  Using the wrong offset makes vma_mm() return an rb_node
+ * pointer instead of the mm pointer, which causes every subsequent
+ * get_user_pte(vma_mm(vma), ...) call to fail.
+ *
+ * Here we always have a verified (vma, mm) pair, so re-scan once if the
+ * currently recorded offset does not agree with this pair.
+ */
+void lazy_scan_vma_struct_offsets(void* mm, void* vma)
+{
+    if (vma_vm_mm_offset >= 0 &&
+        GET_FIELD(vma, vma_vm_mm_offset, void *) != mm) {
+        int i;
+        int found = 0;
+
+        for (i = 0x10; i < 0x80; i += 8) {
+            u64 val;
+            if (!safe_read_u64((unsigned long)vma + i, &val))
+                continue;
+            if (val == (u64)mm) {
+                pr_info("wxshadow: corrected vma_vm_mm_offset 0x%x → 0x%x\n",
+                        vma_vm_mm_offset, i);
+                vma_vm_mm_offset = i;
+                found = 1;
+                break;
+            }
+        }
+        if (!found)
+            pr_warn("wxshadow: [%s] could not detect vma_vm_mm_offset, vma_mm() may be unreliable\n",
+                    __func__);
+    }
+};
+
 /* ========== task_struct offset detection ========== */
 
 #define TASK_COMM_LEN 16

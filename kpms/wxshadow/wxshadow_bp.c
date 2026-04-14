@@ -63,6 +63,8 @@ static int prepare_shadow_target(void *mm, unsigned long addr,
         return -1;
     }
 
+    lazy_scan_vma_struct_offsets(mm, vma);
+
     ret = wxshadow_try_split_pmd(mm, vma, page_addr);
     if (ret < 0) {
         pr_err("wxshadow: [%s] PMD split failed for %lx: %d\n",
