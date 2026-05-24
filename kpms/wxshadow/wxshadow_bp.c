@@ -1217,6 +1217,42 @@ int wxshadow_do_del_bp(void *mm, unsigned long addr)
 
 /* ========== prctl hook ========== */
 
+/*
+ * Check if current task has root privileges.
+ * Reads uid/euid from struct cred using common kernel offsets.
+ */
+static bool wxshadow_is_root(void)
+{
+    void *cred;
+    u64 val1 = 0xFFFFFFFFULL;
+    u64 val2 = 0xFFFFFFFFULL;
+
+    if (task_struct_offset.cred_offset <= 0)
+        return false;
+
+    cred = GET_FIELD(current, task_struct_offset.cred_offset, void *);
+    if (!cred || !is_kva((unsigned long)cred))
+        return false;
+
+    if (!safe_read_u64((unsigned long)cred + 0x04, &val1))
+        val1 = 0xFFFFFFFFULL;
+    if (!safe_read_u64((unsigned long)cred + 0x14, &val2))
+        val2 = 0xFFFFFFFFULL;
+
+    return ((val1 & 0xFFFFFFFF) == 0) || ((val2 & 0xFFFFFFFF) == 0);
+}
+
+/*
+ * Check if current task is allowed to operate on target_pid.
+ * ALL wxshadow operations require root privileges, including self-targeting.
+ * This prevents any unprivileged app from probing the interface via prctl.
+ */
+static bool wxshadow_may_access_pid(pid_t target_pid)
+{
+    (void)target_pid;
+    return wxshadow_is_root();
+}
+
 /* Resolve pid to mm_struct. Returns mm with refcount held (caller must mmput). */
 static void *resolve_pid_to_mm(pid_t pid)
 {
@@ -1249,9 +1285,46 @@ void prctl_before(hook_fargs4_t *args, void *udata)
     int ret;
     pid_t pid;
 
-    /* Only track wxshadow prctl calls for in-flight counting */
-    if (option < PR_WXSHADOW_SET_BP || option > PR_WXSHADOW_RELEASE)
+    /*
+     * Use exact switch instead of range check to prevent timing side-channel
+     * on option values within range but not handled (e.g. 0x57580007).
+     * If not our option, let original prctl return -EINVAL as usual.
+     */
+    switch (option) {
+    case PR_WXSHADOW_SET_BP:
+    case PR_WXSHADOW_SET_REG:
+    case PR_WXSHADOW_DEL_BP:
+    case PR_WXSHADOW_SET_TLB_MODE:
+    case PR_WXSHADOW_GET_TLB_MODE:
+    case PR_WXSHADOW_PATCH:
+    case PR_WXSHADOW_RELEASE:
+        break;
+    default:
         return;
+    }
+
+    /*
+     * Authorization check BEFORE any timing-sensitive operations.
+     * If denied, fall through to original prctl which returns -EINVAL,
+     * making behavior identical to module-not-loaded (semantic side-channel
+     * mitigation).  Timing is also identical because we return immediately.
+     */
+    switch (option) {
+    case PR_WXSHADOW_SET_BP:
+    case PR_WXSHADOW_SET_REG:
+    case PR_WXSHADOW_DEL_BP:
+    case PR_WXSHADOW_PATCH:
+    case PR_WXSHADOW_RELEASE:
+        pid = (pid_t)arg2;
+        if (!wxshadow_may_access_pid(pid))
+            return;
+        break;
+    case PR_WXSHADOW_SET_TLB_MODE:
+    case PR_WXSHADOW_GET_TLB_MODE:
+        if (!wxshadow_is_root())
+            return;
+        break;
+    }
 
     WX_HANDLER_ENTER();
 
